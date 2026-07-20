@@ -4,5 +4,3 @@
 /frontend/dist/
 /frontend/node_modules/
 /.idea/
-/pretraining/*
-/sam2/onnx/*
