@@ -34,49 +34,6 @@ button stays disabled. The standalone predictor and "Export Executable" need
 `pyinstaller` and a build of `standalone/predictor.spec` — see
 `standalone/README.md`.
 
-## Structure
-
-```
-backend/
-  main.py            entry point
-  api.py              JS bridge
-  model.py            U-Net, pre-trained 
-  train.py            semi-supervised loop 
-  data.py              GeoTIFF I/O, normalization, patch handling
-  project.py           config, tiling, autosave
-  report.py            accuracy report generation
-  sam_service.py       SAM2 click-to-segment assist (ONNX runtime)
-  export_sam_onnx.py   exports Efficient-SAM2 
-  
-frontend/src/          React (Vite)
-  App.jsx               top-level state
-  App.css               all app styling
-  bridge.js             thin wrapper around window.pywebview.api
-  constants.js           classes, colors, unlabeled value
-  main.jsx               React root
-  
-  components/
-    Viewport.jsx          shared pan/zoom canvas used by both panes
-    InferencePane.jsx      left pane
-    LabelerPane.jsx        right pane
-    Toolbar.jsx             top toolbar: menus, tools, brush size etc.
-    Dropdown.jsx            toolbar dropdown menu
-    ContextMenu.jsx         mouse-anchored context menu 
-    ThumbnailStrip.jsx      project image thumbnails 
-    ProjectSetup.jsx        new/edit project dialog 
-    AccuracyReport.jsx      validation vs. training IoU report
-    
-standalone/             self-contained ONNX predictor (GUI + CLI)
-                        
-sam2/onnx/              exported SAM2 encoder/decoder (*.onnx), required for the SAM2 tool
-
-pretraining/pretrained.pth  default weights the model resets to
-
-project-template.json  starter config for new multi-image projects
-
-00.tiff                 sample 10-band stack (512x512, EPSG:32635)
-```
-
 ## How it works
 ### 1. Data & Classes
 
