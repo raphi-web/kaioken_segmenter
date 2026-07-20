@@ -17,50 +17,6 @@ Workflow: paint ground-truth strokes on the right pane, click
 Iterate until the prediction is good, then export the model (`.pth`/`.onnx`),
 a standalone executable, or the merged mask.
 
-## Structure
-
-```
-backend/
-  main.py            entry point: pywebview window hosting the built frontend
-  api.py              JS bridge (image/overlay transfer, labels, training, exports)
-  model.py            U-Net, pre-trained EfficientNet-B0 encoder, optional PointRend head
-  train.py            semi-supervised loop (CE + pseudo-labels + consistency)
-  data.py              GeoTIFF I/O, robust normalization, patch handling
-  project.py           multi-image projects: config, tiling, autosave
-  report.py            accuracy report generation (train/validation IoU)
-  sam_service.py       SAM2 click-to-segment assist (ONNX runtime)
-  export_sam_onnx.py   exports Efficient-SAM2 encoder/decoder to sam2/onnx/
-  
-frontend/src/          React (Vite)
-  App.jsx               top-level state: bridge calls, tool/label state, panes wiring
-  App.css               all app styling
-  bridge.js             thin wrapper around window.pywebview.api
-  constants.js           classes, colors, unlabeled value
-  main.jsx               React root
-  
-  components/
-    Viewport.jsx          shared pan/zoom canvas used by both panes
-    InferencePane.jsx      left pane: RGB + prediction overlay + uncertainty heatmap
-    LabelerPane.jsx        right pane: strokes/polygon/SAM2 painting
-    Toolbar.jsx             top toolbar: menus, tools, brush size, epochs/train, status
-    Dropdown.jsx            toolbar dropdown menu (trigger + closable menu)
-    ContextMenu.jsx         mouse-anchored context menu (thumbnail strip right-click)
-    ThumbnailStrip.jsx      project image thumbnails; switch/move to validation set
-    ProjectSetup.jsx        new/edit project dialog (bands, patch size, PointRend, folders)
-    AccuracyReport.jsx      validation vs. training IoU report
-    
-standalone/             self-contained ONNX predictor (GUI + CLI), packaged separately
-                        with PyInstaller — see standalone/README.md
-                        
-sam2/onnx/              exported SAM2 encoder/decoder (*.onnx), required for the SAM2 tool
-
-pretraining/pretrained.pth  default weights the model resets to
-
-project-template.json  starter config for new multi-image projects
-
-00.tiff                 sample 10-band stack (512x512, EPSG:32635)
-```
-
 ## Setup & run
 
 ```bash
@@ -77,6 +33,49 @@ The SAM2 click-assist tool needs `sam2/onnx/*.onnx` (regenerate with
 button stays disabled. The standalone predictor and "Export Executable" need
 `pyinstaller` and a build of `standalone/predictor.spec` — see
 `standalone/README.md`.
+
+## Structure
+
+```
+backend/
+  main.py            entry point
+  api.py              JS bridge
+  model.py            U-Net, pre-trained 
+  train.py            semi-supervised loop 
+  data.py              GeoTIFF I/O, normalization, patch handling
+  project.py           config, tiling, autosave
+  report.py            accuracy report generation
+  sam_service.py       SAM2 click-to-segment assist (ONNX runtime)
+  export_sam_onnx.py   exports Efficient-SAM2 
+  
+frontend/src/          React (Vite)
+  App.jsx               top-level state
+  App.css               all app styling
+  bridge.js             thin wrapper around window.pywebview.api
+  constants.js           classes, colors, unlabeled value
+  main.jsx               React root
+  
+  components/
+    Viewport.jsx          shared pan/zoom canvas used by both panes
+    InferencePane.jsx      left pane
+    LabelerPane.jsx        right pane
+    Toolbar.jsx             top toolbar: menus, tools, brush size etc.
+    Dropdown.jsx            toolbar dropdown menu
+    ContextMenu.jsx         mouse-anchored context menu 
+    ThumbnailStrip.jsx      project image thumbnails 
+    ProjectSetup.jsx        new/edit project dialog 
+    AccuracyReport.jsx      validation vs. training IoU report
+    
+standalone/             self-contained ONNX predictor (GUI + CLI)
+                        
+sam2/onnx/              exported SAM2 encoder/decoder (*.onnx), required for the SAM2 tool
+
+pretraining/pretrained.pth  default weights the model resets to
+
+project-template.json  starter config for new multi-image projects
+
+00.tiff                 sample 10-band stack (512x512, EPSG:32635)
+```
 
 ## How it works
 ### 1. Data & Classes
