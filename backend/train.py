@@ -22,17 +22,22 @@ import torch.nn.functional as F
 from data import UNLABELED
 
 EXCLUDED = 254  # internal: source-nodata pixels take part in no loss at all
-BATCH_SIZE = 32
-CONFIDENCE_THRESHOLD = 0.95
+BATCH_SIZE = 16
+CONFIDENCE_THRESHOLD = 0.93
 LAMBDA_LOVASZ = 1.0
 LAMBDA_PSEUDO = 0.5
 LAMBDA_CONSISTENCY = 1.0
-WARMUP_EPOCHS = (
-    10  # cumulative epochs of supervised-only training before pseudo/consistency
-)
-RAMP_EPOCHS = 5  # epochs *after* the warm-up to reach full unsupervised weight
-MIN_EPOCHS = WARMUP_EPOCHS + RAMP_EPOCHS  # a run must cover both phases to be useful
-SEMI_SUPERVISED_MIN_EPOCHS = 15  # shorter runs stay supervised-only (user labels only)
+# The unsupervised phase is gated on the model being demonstrably good rather
+# than on an epoch count: pseudo-labels are only worth training on once the
+# model's own predictions are. The threshold is read against the same live
+# target IoU the run reports, which is measured on the strongly-augmented view
+# and so sits below what the model scores on clean imagery.
+TARGET_IOU_STABILITY = 0.55  # live target IoU the model must reach...
+STABILITY_PATIENCE = 3  # ...and hold for this many consecutive epochs
+# Once the gate opens the ramp spans a share of whatever training is left
+# instead of a fixed count, so a long run fades the terms in slowly.
+RAMP_FRACTION = 0.6
+RAMP_MIN_EPOCHS = 5  # ...but never shorter than this, however little is left
 
 weak_transform = A.Compose(
     [
@@ -229,7 +234,7 @@ def _make_batches(image, labels, rng, skip_unlabeled=False):
         )
 
 
-def train(model, samples, epochs, epochs_done=0, progress=None, stop_event=None):
+def train(model, samples, epochs, progress=None, stop_event=None):
     """Run the hybrid loop for `epochs` epochs over every labeled image.
 
     model: model.SegmentationModel;
@@ -238,30 +243,40 @@ def train(model, samples, epochs, epochs_done=0, progress=None, stop_event=None)
     image per epoch and the result is dropped afterwards, so only a single
     image is resident at a time no matter how large the project is. Labels are
     in label space (= model class space): 0 target, 1 background, 255 unlabeled;
-    epochs_done: cumulative epochs from previous runs (drives the warm-up and
-    ramp-up); progress: callback(dict) after each epoch; stop_event:
-    threading.Event. Returns the number of epochs actually completed, which is
-    at least MIN_EPOCHS unless stopped early.
+    progress: callback(dict) after each epoch; stop_event: threading.Event.
+    Returns the number of epochs actually completed, which is `epochs` unless
+    stopped early.
 
     An epoch is one shuffled pass over the patch grids of all samples, so the
     reported losses average over the whole labeled set.
 
-    The first WARMUP_EPOCHS cumulative epochs are purely supervised: the
-    unsupervised losses are gated off and fully-unlabeled patches are skipped,
-    so the model first fits the explicit user labels. Afterwards pseudo-labeling
-    and consistency fade in over RAMP_EPOCHS.
+    The run opens purely supervised: the unsupervised losses are gated off and
+    fully-unlabeled patches are skipped, so the model first fits the explicit
+    user labels. The gate opens on measured quality rather than on an epoch
+    count -- the live target IoU must reach TARGET_IOU_STABILITY and hold it for
+    STABILITY_PATIENCE consecutive epochs -- because training on the model's own
+    predictions is only worth doing once those predictions are, and a model that
+    is merely passing through a good epoch will bake its noise in. Afterwards
+    pseudo-labeling and consistency fade in over RAMP_FRACTION of the epochs
+    that remain, so the fade stretches with the run instead of always taking a
+    fixed handful of epochs.
 
-    A run whose selected length is below SEMI_SUPERVISED_MIN_EPOCHS is too short
-    for pseudo-labeling/consistency to pay off, so it stays in that
-    supervised-only mode for its whole duration, fitting the user-drawn labels
-    alone.
+    The gate latches: once open it stays open for the rest of the run. A later
+    IoU dip must not flip fully-unlabeled patches back out of the batches or
+    rewind the ramp, which would leave the loss composition oscillating.
+
+    Because the gate is measured, not scheduled, it is scoped to this run: a
+    resumed run re-earns it (STABILITY_PATIENCE epochs, since the model is
+    already good) and re-ramps from there rather than resuming at full weight.
+
+    `epochs` is run as asked, with no minimum imposed: the gate already
+    withholds the unsupervised phase from a model that has not proved itself, so
+    a run too short to reach it simply stays supervised throughout instead of
+    needing to be lengthened into safety.
     """
     if not samples:
         raise ValueError("No labeled images to train on")
-    # Decided on the selected length, before the MIN_EPOCHS floor below (which
-    # sits under the threshold, so the floor can't flip the decision).
-    supervised_only = int(epochs) < SEMI_SUPERVISED_MIN_EPOCHS
-    epochs = max(MIN_EPOCHS, int(epochs))
+    epochs = max(1, int(epochs))  # a run of zero epochs is a no-op, not a request
     net = model.net
     device = model.device
     # Lovasz collapses every ignored pixel into a single void id, so EXCLUDED is
@@ -283,21 +298,26 @@ def train(model, samples, epochs, epochs_done=0, progress=None, stop_event=None)
         optimizer, factor=0.5, patience=5
     )
     rng = np.random.default_rng()
+    gate_epoch = None  # first epoch to carry unsupervised losses; None while gated off
+    stable_epochs = 0  # consecutive epochs at or above TARGET_IOU_STABILITY
 
     for epoch in range(epochs):
         if stop_event is not None and stop_event.is_set():
             return epoch
         net.train()
-        cumulative = epochs_done + epoch
-        warmup = supervised_only or cumulative < WARMUP_EPOCHS
-        # Rebased onto the end of the warm-up: on the old formula the ramp hit
-        # 1.0 exactly as the gate opened, so the unsupervised losses arrived at
-        # full weight in one step.
-        ramp = (
-            0.0
-            if supervised_only
-            else min(1.0, max(0.0, (cumulative + 1 - WARMUP_EPOCHS) / RAMP_EPOCHS))
-        )
+        warmup = gate_epoch is None
+        if warmup:
+            ramp = 0.0
+        else:
+            # A share of what was left when the gate opened, floored so a gate
+            # that opens near the end still fades rather than steps.
+            ramp_epochs = max(
+                RAMP_MIN_EPOCHS, round(RAMP_FRACTION * (epochs - gate_epoch))
+            )
+            # Rebased onto the gate: the first gated epoch gets 1/ramp_epochs,
+            # not 0. It pays for the second forward pass either way, so it
+            # should get some weight for it.
+            ramp = min(1.0, (epoch - gate_epoch + 1) / ramp_epochs)
         sums = {"sup": 0.0, "lov": 0.0, "pseudo": 0.0, "cons": 0.0}
         n_batches = 0
         iou_inter = 0.0  # target-class intersection/union over labeled pixels,
@@ -397,19 +417,34 @@ def train(model, samples, epochs, epochs_done=0, progress=None, stop_event=None)
         loss_sup_epoch = (sums["sup"] + LAMBDA_LOVASZ * sums["lov"]) / denom
 
         # Plateau is measured on the supervised loss alone, not the total: the
-        # pseudo/consistency terms switch on at WARMUP_EPOCHS and ramp over the
-        # next RAMP_EPOCHS, so the total rises there by composition rather than
-        # by the model getting worse, and a plateau step would read that as
-        # regression. An epoch that skipped every batch has no measurement at
-        # all -- its 0.0 would look like a record improvement and reset the
-        # patience counter -- so it does not step.
+        # pseudo/consistency terms switch on at the gate and ramp in afterwards,
+        # so the total rises there by composition rather than by the model
+        # getting worse, and a plateau step would read that as regression. An
+        # epoch that skipped every batch has no measurement at all -- its 0.0
+        # would look like a record improvement and reset the patience counter --
+        # so it does not step.
         if n_batches:
             scheduler.step(loss_sup_epoch)
 
+        # None when the epoch saw no labeled target pixels (e.g. only background
+        # labels drawn), so the readout hides rather than shows 0.
+        iou = iou_inter / iou_union if iou_union else None
+
+        # The gate: the model has to earn the unsupervised phase by holding the
+        # threshold, and an unscoreable epoch is no evidence that it has, so it
+        # breaks the streak rather than passing silently. A project with no
+        # target labels anywhere therefore never opens the gate and stays
+        # supervised-only -- which is the honest outcome, since there is nothing
+        # to verify the model's own predictions against.
+        if gate_epoch is None:
+            if iou is not None and iou >= TARGET_IOU_STABILITY:
+                stable_epochs += 1
+                if stable_epochs >= STABILITY_PATIENCE:
+                    gate_epoch = epoch + 1  # the losses start on the next epoch
+            else:
+                stable_epochs = 0
+
         if progress is not None:
-            # None when the epoch saw no labeled target pixels (e.g. only
-            # background labels drawn), so the readout hides rather than shows 0.
-            iou = iou_inter / iou_union if iou_union else None
             progress(
                 {
                     "epoch": epoch + 1,

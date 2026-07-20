@@ -62,7 +62,8 @@ class Api:
                         "result": None, "error": None}
         self._report_stop = threading.Event()
         self._status = {"state": "idle", "epoch": 0, "epochs": 0, "total_epochs": 0,
-                       "images": 0,
+                       "images": 0, "ramp": None, "stage": None,
+                       "scan_done": 0, "scan_total": 0,
                        "loss_sup": None, "loss_pseudo": None, "loss_cons": None, "error": None}
         if project_root:
             result = self._init_project(project_root)
@@ -234,7 +235,7 @@ class Api:
 
     # ---------- training ----------
 
-    def _labeled_samples(self):
+    def _labeled_samples(self, on_progress=None):
         """(name, role, loader) for every labeled image in the project.
 
         One disk scan shared by training and the accuracy report, so the two can
@@ -247,6 +248,11 @@ class Api:
         its in-memory labels (which may not be saved yet); the others are taken
         from masks_user/. Loaders are lazy so callers hold one image at a time
         instead of the whole project.
+
+        Each candidate costs a mask read plus a header open, so on a large
+        project this runs for many seconds; on_progress(done, total) is called
+        per image so a caller on a worker thread can report the wait instead of
+        appearing hung. It is notification only -- it cannot abort the scan.
         """
         if self._image is None:
             return []
@@ -260,7 +266,10 @@ class Api:
             active = [(self._image_name, self._project.image_role(self._image_name),
                        active[0][2])]
         samples = []
-        for name in self._project.list_images():
+        names = self._project.list_images()
+        for done, name in enumerate(names):
+            if on_progress is not None:
+                on_progress(done, len(names))
             if name == self._image_name:
                 samples.extend(active)
                 continue
@@ -272,16 +281,9 @@ class Api:
                 continue  # stale mask from a resized/replaced image
             samples.append((name, self._project.image_role(name),
                             self._make_sample_loader(name, mask)))
+        if on_progress is not None:
+            on_progress(len(names), len(names))
         return samples
-
-    def _training_samples(self):
-        """(name, loader) for the labeled images the model may train on.
-
-        Validation images are held out entirely — not merely their labels — so
-        the accuracy report scores the model on imagery it has never seen.
-        """
-        return [(name, load) for name, role, load in self._labeled_samples()
-                if role == "training"]
 
     def _mask_fits_image(self, name, mask):
         """Cheap header-only check that a saved mask still matches its image."""
@@ -301,55 +303,85 @@ class Api:
         return load
 
     def start_training(self, epochs):
+        """Validate cheaply, then hand the whole run to a worker.
+
+        Only the guards that cost nothing are answered here. Collecting the
+        samples reads and shape-checks every mask in the project, which on a
+        large project runs for many seconds, so it happens on the worker with
+        the status already reading "training" -- otherwise the UI sits on an
+        idle-looking toolbar for the whole scan. The cost of that is that "you
+        have not labeled anything" can no longer be returned from this call; it
+        arrives through the status like any other training failure.
+        """
         if self._image is None:
             return {"ok": False, "error": "No image loaded"}
         if self._status["state"] == "training":
             return {"ok": False, "error": "Training already running"}
         if self._report["running"]:
             return {"ok": False, "error": "Wait for the accuracy report to finish"}
-        labeled = self._labeled_samples()
-        samples = [(name, load) for name, role, load in labeled if role == "training"]
-        if not samples:
-            # Distinguish "nothing labeled" from "everything labeled is held
-            # out", which is otherwise a baffling place to land.
-            if labeled:
-                return {"ok": False,
-                        "error": f"All {len(labeled)} labeled image"
-                                 f"{'s are' if len(labeled) != 1 else ' is'} in the "
-                                 f"validation set; right-click a thumbnail to move "
-                                 f"one to training"}
-            return {"ok": False, "error": "Label at least one image before training"}
-        # Same floor train() applies, so the reported total is right from the
-        # start rather than being corrected by the first progress callback.
-        epochs = max(train_module.MIN_EPOCHS, int(epochs))
+        # Same clamp train() applies, so the reported total is right from the
+        # start rather than being corrected by the first progress callback. Only
+        # a floor of 1 -- the selected length is otherwise run as asked, and is
+        # returned below so the caller can show what is actually being trained.
+        epochs = max(1, int(epochs))
         self._stop_event.clear()
-        self._status.update({"state": "training", "epoch": 0, "epochs": epochs,
-                             "images": len(samples), "error": None})
-        loaders = [load for _, load in samples]
-        threading.Thread(target=self._train_worker, args=(epochs, loaders),
+        self._status.update({"state": "training", "stage": "collecting",
+                             "epoch": 0, "epochs": epochs, "images": 0,
+                             "scan_done": 0, "scan_total": 0, "error": None})
+        threading.Thread(target=self._train_worker, args=(epochs,),
                          daemon=True).start()
-        return {"ok": True, "images": len(samples),
-                "names": [name for name, _ in samples]}
+        return {"ok": True, "epochs": epochs}
 
     def stop_training(self):
         self._stop_event.set()
         return {"ok": True}
 
-    def _train_worker(self, epochs, loaders):
+    def _on_scan(self, done, total):
+        self._status.update({"scan_done": done, "scan_total": total})
+
+    def _train_worker(self, epochs):
         try:
+            labeled = self._labeled_samples(on_progress=self._on_scan)
+            # Validation images are held out entirely -- not merely their labels
+            # -- so the accuracy report scores the model on imagery it has never
+            # seen.
+            samples = [(name, load) for name, role, load in labeled
+                       if role == "training"]
+            if not samples:
+                # Distinguish "nothing labeled" from "everything labeled is held
+                # out", which is otherwise a baffling place to land.
+                if labeled:
+                    self._fail_training(
+                        f"All {len(labeled)} labeled image"
+                        f"{'s are' if len(labeled) != 1 else ' is'} in the "
+                        f"validation set; right-click a thumbnail to move "
+                        f"one to training")
+                else:
+                    self._fail_training("Label at least one image before training")
+                return
+            # The scan is not interruptible, so a Stop pressed during it lands
+            # here rather than being lost.
+            if self._stop_event.is_set():
+                self._status.update({"state": "idle", "stage": None})
+                return
+            self._status.update({"stage": "running", "images": len(samples)})
             with self._lock:
                 done = train_module.train(
-                    self._model, loaders, epochs,
-                    epochs_done=self._status["total_epochs"],
+                    self._model, [load for _, load in samples], epochs,
                     progress=self._on_progress,
                     stop_event=self._stop_event,
                 )
                 self._status["total_epochs"] += done
                 self._save_model_checkpoint()
                 self._class_map, self._probs = self._model.predict_image(self._image)
-            self._status["state"] = "idle"
+            self._status.update({"state": "idle", "stage": None})
         except Exception:
-            self._status.update({"state": "error", "error": traceback.format_exc(limit=3)})
+            self._status.update({"state": "error", "stage": None,
+                                 "error": traceback.format_exc(limit=3)})
+
+    def _fail_training(self, message):
+        """End the run with a message meant for the user, not a traceback."""
+        self._status.update({"state": "error", "stage": None, "error": message})
 
     def _on_progress(self, stats):
         self._status.update({
@@ -359,6 +391,10 @@ class Api:
             "loss_pseudo": round(stats["loss_pseudo"], 4),
             "loss_cons": round(stats["loss_cons"], 4),
             "iou": stats["iou"],  # live target IoU, or None if unscoreable
+            # 0.0 while the unsupervised gate is still shut. Surfaced because
+            # the gate opens on measured IoU rather than on a fixed epoch, so
+            # without it a run of zero pseudo/cons losses is unreadable.
+            "ramp": stats["ramp"],
         })
 
     def get_status(self):
@@ -425,7 +461,8 @@ class Api:
                 except FileNotFoundError:
                     pass
         self._status.update({"state": "idle", "epoch": 0, "epochs": 0, "total_epochs": 0,
-                             "images": 0,
+                             "images": 0, "ramp": None, "stage": None,
+                             "scan_done": 0, "scan_total": 0,
                              "loss_sup": None, "loss_pseudo": None, "loss_cons": None, "error": None})
         return {"ok": True}
 
@@ -654,7 +691,8 @@ class Api:
             self._dirty_labels = {}
             self._dirty_geo = {}
         self._status.update({"state": "idle", "epoch": 0, "epochs": 0,
-                             "total_epochs": restored_epochs, "images": 0,
+                             "total_epochs": restored_epochs, "images": 0, "ramp": None,
+                             "stage": None, "scan_done": 0, "scan_total": 0,
                              "loss_sup": None, "loss_pseudo": None, "loss_cons": None,
                              "error": None})
         self._project = project

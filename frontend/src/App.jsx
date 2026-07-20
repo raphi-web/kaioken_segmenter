@@ -20,6 +20,11 @@ export default function App() {
   const [status, setStatus] = useState(null)
   const [tool, setTool] = useState({ classId: 0, brushSize: 8, eraser: false, mode: 'brush' })
   const [epochs, setEpochs] = useState(10)
+  // start_training reads and shape-checks every project mask before it spawns
+  // the worker, which on a large project runs for many seconds. Until it
+  // returns the backend still reports "idle", so the run is tracked here to
+  // keep the toolbar from looking inert (and from taking a second click).
+  const [starting, setStarting] = useState(false)
   const [labeledPixels, setLabeledPixels] = useState(0)
   const [labelsVersion, setLabelsVersion] = useState(0) // bumped on undo
   const [undoDepth, setUndoDepth] = useState(0)
@@ -223,10 +228,22 @@ export default function App() {
   }
 
   async function handleTrain() {
-    await pushLabels()
-    const res = await api('start_training', epochs)
-    if (!res.ok) setMessage(res.error)
-    else setMessage(`Training on ${res.images} labeled image${res.images === 1 ? '' : 's'}`)
+    setStarting(true)
+    setMessage('Starting training…')
+    try {
+      await pushLabels()
+      const res = await api('start_training', epochs)
+      if (!res.ok) { setMessage(res.error); return }
+      // Runs as asked; this only ever corrects an emptied box (which submits 0).
+      if (res.epochs !== epochs) setEpochs(res.epochs)
+      // start_training flips the status to "training" before it returns, so
+      // reading it back here hands over to the poller without a gap in which
+      // the toolbar would drop back to an idle "Train" button. From here the
+      // status carries the run, including the sample scan and its failures.
+      setStatus(await api('get_status'))
+    } finally {
+      setStarting(false)
+    }
   }
 
   async function handleExport(method) {
@@ -406,6 +423,7 @@ export default function App() {
         epochs={epochs}
         setEpochs={setEpochs}
         status={status}
+        starting={starting}
         labeledPixels={labeledPixels}
         undoDepth={undoDepth}
         onTrain={handleTrain}
