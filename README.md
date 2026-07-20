@@ -1,5 +1,5 @@
 # Sentinel-2 Interactive Segmentation
-
+![screenshot.png](readme_assets/screenshot.png)
 ## Disclaimer
 
 This is a prototype for human-in-the-loop (binary) semantic segmentation in
