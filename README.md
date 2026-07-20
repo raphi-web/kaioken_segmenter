@@ -1,11 +1,14 @@
-# Sentinel-2 Interactive Segmentation
+# Kaio-ken Segmenter  
+
+## A label tool for Remote Sensing, supports GeoTiffs with more than just 3 Bands! 
+
 ![screenshot.png](readme_assets/screenshot.png)
 ## Disclaimer
 
 This is a prototype for human-in-the-loop (binary) semantic segmentation in
 remote sensing with semi-supervised training.
 I build this after some exciting talks in a conference. **I also used
-AI-Code generation in this project to get started.**
+AI code generation in this project to get started.**
 
 The tool turned out to be very useful to my work in remote sensing, and I
 hope it is useful for others too.
@@ -53,7 +56,9 @@ button stays disabled. The standalone predictor and "Export Executable" need
 
 - Supervised: Standard cross-entropy on user-labeled pixels (user input overrides model).
 - Semi-supervised: FixMatch-style pseudo-labeling on confident (>0.9) predictions.
-- Consistency: MSE between weak/strong augmentations; loss terms ramp up over 5 epochs.
+- Consistency: MSE between weak/strong augmentations.
+- Gating: the unsupervised terms stay off until the model holds a target IoU of
+  0.55 for 3 consecutive epochs, then fade in over 60% of the epochs that remain.
 
 ### 4. SAM2 Assist
 
