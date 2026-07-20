@@ -12,8 +12,9 @@ IN_CHANNELS = 10
 OUT_LOGITS = 1
 POINT_RATIO = 16
 POINT_HIDDEN = 64
-# Weights produced by pretraining/pretrain.py; loaded (minus the segmentation
-# head, whose class count differs) as the default initialization when present.
+# Weights produced by ../pretraining/pretrain.py (kept outside the project);
+# loaded (minus the segmentation head, whose class count differs) as the
+# default initialization when present.
 DEFAULT_WEIGHTS = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     os.pardir,

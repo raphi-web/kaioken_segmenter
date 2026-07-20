@@ -29,9 +29,12 @@ import torch
 import torch.nn as nn
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_SAM_DIR = os.path.join(_PROJECT_ROOT, "sam2")
+# The Efficient-SAM2 repo and .pt checkpoints live outside the project (only
+# needed to regenerate the ONNX graphs, not at app runtime); only the
+# exported sam2/onnx/ output ships with the project.
+_SAM_DIR = os.path.join(_PROJECT_ROOT, os.pardir, "sam2")
 _REPO_DIR = os.path.join(_SAM_DIR, "Efficient-SAM2")
-_ONNX_DIR = os.path.join(_SAM_DIR, "onnx")
+_ONNX_DIR = os.path.join(_PROJECT_ROOT, "sam2", "onnx")
 
 _MODELS = {
     "tiny": ("configs/sam2.1/sam2.1_hiera_t.yaml", "sam2.1_hiera_tiny.pt"),
