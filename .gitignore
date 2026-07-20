@@ -1,0 +1,16 @@
+/sam2/Efficient-SAM2/
+/sam2/sam2.1_hiera_small.pt
+/sam2/sam2.1_hiera_tiny.pt
+/sam2/onnx/sam2.1_hiera_tiny.encoder.onnx
+/sam2/onnx/sam2.1_hiera_tiny.decoder.onnx
+/standalone/build/
+/standalone/dist/
+/venv/
+/frontend/dist/
+/frontend/node_modules/
+/.idea/
+/pretraining/Dataset-128x128.h5
+/pretraining/eval_diff_maps.py
+/pretraining/*.py
+/pretraining/diff_maps/
+/pretraining/diff_maps_original/

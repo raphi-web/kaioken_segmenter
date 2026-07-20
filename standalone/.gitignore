@@ -1,0 +1,5 @@
+# PyInstaller build artifacts (large; rebuild with predictor.spec).
+build/
+dist/
+*.spec.bak
+__pycache__/
