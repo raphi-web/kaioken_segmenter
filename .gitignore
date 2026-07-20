@@ -1,5 +1,7 @@
 /standalone/build/
 /standalone/dist/
+/build/
+/dist/
 /venv/
 /frontend/dist/
 /frontend/node_modules/

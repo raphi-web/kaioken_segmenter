@@ -20,6 +20,7 @@ The ONNX files live in `sam2/onnx/`; regenerate them with::
 """
 
 import os
+import sys
 import threading
 
 import numpy as np
@@ -29,8 +30,14 @@ try:
 except ImportError:  # pragma: no cover - opencv is a project dependency
     cv2 = None
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_ONNX_DIR = os.path.join(_PROJECT_ROOT, "sam2", "onnx")
+# Source tree: sam2/onnx next to backend/ (see export_sam_onnx.py).
+# Frozen app: sam2/onnx next to this executable -- build_app.sh copies it
+# there when present, mirroring how it bundles the standalone predictor.
+if getattr(sys, "frozen", False):
+    _ONNX_DIR = os.path.join(os.path.dirname(sys.executable), "sam2", "onnx")
+else:
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _ONNX_DIR = os.path.join(_PROJECT_ROOT, "sam2", "onnx")
 
 # Model size -> filename stem of its exported encoder/decoder graphs.
 _MODELS = {"tiny": "sam2.1_hiera_tiny", "small": "sam2.1_hiera_small"}

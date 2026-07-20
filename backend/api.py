@@ -6,6 +6,7 @@ JSON-serializable data, so each JS call resolves as a promise.
 
 import base64
 import os
+import sys
 import threading
 import time
 import traceback
@@ -33,9 +34,17 @@ CLASS_COLORS = {
 
 # Prebuilt standalone predictor (PyInstaller onedir). "Export Executable" copies
 # this folder and drops the current model.onnx beside the binary.
-_PREDICTOR_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "standalone", "dist", "predictor")
+#
+# Source tree: standalone/dist/predictor (from standalone/build.sh).
+# Frozen app: standalone/predictor next to this executable -- build_app.sh
+# copies standalone/dist/predictor there so both builds serve the same feature.
+if getattr(sys, "frozen", False):
+    _PREDICTOR_DIR = os.path.join(
+        os.path.dirname(sys.executable), "standalone", "predictor")
+else:
+    _PREDICTOR_DIR = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "standalone", "dist", "predictor")
 
 
 class Api:

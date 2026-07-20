@@ -8,11 +8,16 @@ import sys
 
 import webview
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False):
+    # PyInstaller bundle: backend/*.py are collected as top-level modules
+    # (already importable) and frontend/dist is bundled under _MEIPASS.
+    PROJECT_ROOT = sys._MEIPASS
+else:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from api import Api
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND = os.path.join(PROJECT_ROOT, "frontend", "dist", "index.html")
 DEFAULT_IMAGE = os.path.join(PROJECT_ROOT, "00.tiff")
 
