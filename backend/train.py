@@ -21,9 +21,9 @@ import torch
 import torch.nn.functional as F
 from data import UNLABELED
 
-EXCLUDED = 254  # internal: source-nodata pixels take part in no loss at all
+EXCLUDED = 254
 BATCH_SIZE = 16
-CONFIDENCE_THRESHOLD = 0.93
+CONFIDENCE_THRESHOLD = 0.92
 LAMBDA_LOVASZ = 1.0
 LAMBDA_PSEUDO = 0.5
 LAMBDA_CONSISTENCY = 1.0
@@ -32,12 +32,12 @@ LAMBDA_CONSISTENCY = 1.0
 # model's own predictions are. The threshold is read against the same live
 # target IoU the run reports, which is measured on the strongly-augmented view
 # and so sits below what the model scores on clean imagery.
-TARGET_IOU_STABILITY = 0.55  # live target IoU the model must reach...
+TARGET_IOU_STABILITY = 0.65  # live target IoU the model must reach...
 STABILITY_PATIENCE = 3  # ...and hold for this many consecutive epochs
 # Once the gate opens the ramp spans a share of whatever training is left
 # instead of a fixed count, so a long run fades the terms in slowly.
 RAMP_FRACTION = 0.6
-RAMP_MIN_EPOCHS = 5  # ...but never shorter than this, however little is left
+RAMP_MIN_EPOCHS = 5
 
 weak_transform = A.Compose(
     [
@@ -63,13 +63,13 @@ strong_transform = A.Compose(
 )
 
 # ---------- multi-patch augmentations ----------
-TARGET = 0  # positive class in label space (0 target, 1 background)
+TARGET = 0
 P_MOSAIC = 0.2
 P_CUTMIX = 0.2
 P_COPY_PASTE = 0.2
-CUTMIX_AREA = (0.05, 0.35)  # pasted box area, as a fraction of the patch
+CUTMIX_AREA = (0.05, 0.35)
 CUTMIX_ASPECT = (0.5, 2.0)
-DONOR_ATTEMPTS = 8  # tries at finding a donor patch that meets a requirement
+DONOR_ATTEMPTS = 8
 
 
 def _sample_patch(image, labels, rng, require=None):
@@ -213,9 +213,8 @@ def _make_batches(image, labels, rng, skip_unlabeled=False):
                 continue
             img_hwc = np.transpose(
                 image.patch(y, x), (1, 2, 0)
-            )  # HWC for albumentations
-            # Multi-patch augmentations first, so both views below come from the
-            # same composed patch and stay pixel-aligned.
+            )
+
             img_hwc, mask = compose_patch(
                 img_hwc, mask, image, labels, rng, prefer_labeled=skip_unlabeled
             )
@@ -279,8 +278,7 @@ def train(model, samples, epochs, progress=None, stop_event=None):
     epochs = max(1, int(epochs))  # a run of zero epochs is a no-op, not a request
     net = model.net
     device = model.device
-    # Lovasz collapses every ignored pixel into a single void id, so EXCLUDED is
-    # folded into UNLABELED before it sees the mask.
+
     lovasz = smp.losses.LovaszLoss(mode="binary", ignore_index=UNLABELED)
 
     param_groups = [
@@ -289,8 +287,7 @@ def train(model, samples, epochs, progress=None, stop_event=None):
         {"params": net.unet.segmentation_head.parameters(), "lr": 2e-3},
     ]
     if getattr(net, "point_head", None) is not None:
-        # PointRend: the head learns through the refined logits scattered into
-        # the map, so it just needs to be optimized alongside the U-Net.
+
         param_groups.append({"params": net.point_head.parameters(), "lr": 2e-3})
 
     optimizer = torch.optim.AdamW(param_groups)
@@ -298,8 +295,8 @@ def train(model, samples, epochs, progress=None, stop_event=None):
         optimizer, factor=0.5, patience=5
     )
     rng = np.random.default_rng()
-    gate_epoch = None  # first epoch to carry unsupervised losses; None while gated off
-    stable_epochs = 0  # consecutive epochs at or above TARGET_IOU_STABILITY
+    gate_epoch = None
+    stable_epochs = 0
 
     for epoch in range(epochs):
         if stop_event is not None and stop_event.is_set():
@@ -309,14 +306,11 @@ def train(model, samples, epochs, progress=None, stop_event=None):
         if warmup:
             ramp = 0.0
         else:
-            # A share of what was left when the gate opened, floored so a gate
-            # that opens near the end still fades rather than steps.
+
             ramp_epochs = max(
                 RAMP_MIN_EPOCHS, round(RAMP_FRACTION * (epochs - gate_epoch))
             )
-            # Rebased onto the gate: the first gated epoch gets 1/ramp_epochs,
-            # not 0. It pays for the second forward pass either way, so it
-            # should get some weight for it.
+
             ramp = min(1.0, (epoch - gate_epoch + 1) / ramp_epochs)
         sums = {"sup": 0.0, "lov": 0.0, "pseudo": 0.0, "cons": 0.0}
         n_batches = 0
@@ -329,8 +323,7 @@ def train(model, samples, epochs, progress=None, stop_event=None):
             if stop_event is not None and stop_event.is_set():
                 return epoch  # mid-epoch: this one does not count as done
             image, labels = samples[idx]()
-            # Labels arrive in model class space; only source-nodata pixels are
-            # excluded from every loss.
+
             labels = labels.copy()
             labels[~image.valid_mask] = EXCLUDED
             for weak, strong, mask in _make_batches(
@@ -340,16 +333,14 @@ def train(model, samples, epochs, progress=None, stop_event=None):
 
                 mask = mask.unsqueeze(
                     1
-                )  # (B, 1, H, W), matching the single-logit output
+                )
                 logits = net(strong)
 
                 sup_target = mask.masked_fill(mask == EXCLUDED, UNLABELED)
                 labeled = sup_target != UNLABELED
-                # Target is the positive class, so flip out of label space (0 target).
+
                 target = (sup_target == 0).float()
-                # Live target IoU over the labeled pixels, read off the same
-                # logits the supervised loss uses (logit > 0 <=> P(target) > 0.5),
-                # so it costs nothing beyond a couple of masked reductions.
+
                 with torch.no_grad():
                     pred_t = (logits > 0) & labeled
                     gt_t = (target > 0.5) & labeled
@@ -368,9 +359,6 @@ def train(model, samples, epochs, progress=None, stop_event=None):
 
                 loss = loss_sup + LAMBDA_LOVASZ * loss_lov
 
-                # The weak view feeds only the unsupervised terms, so while they
-                # are gated off it is never forwarded and the step costs one
-                # forward pass instead of two.
                 if not warmup:
                     weak = weak.to(device)
                     with torch.no_grad():
@@ -411,31 +399,15 @@ def train(model, samples, epochs, progress=None, stop_event=None):
                 n_batches += 1
             del image, labels  # bound memory: one image resident at a time
 
-        # A warm-up epoch over a project whose patches carry no annotation
-        # at all skips every batch; report zeros rather than dividing by it.
         denom = n_batches or 1
         loss_sup_epoch = (sums["sup"] + LAMBDA_LOVASZ * sums["lov"]) / denom
 
-        # Plateau is measured on the supervised loss alone, not the total: the
-        # pseudo/consistency terms switch on at the gate and ramp in afterwards,
-        # so the total rises there by composition rather than by the model
-        # getting worse, and a plateau step would read that as regression. An
-        # epoch that skipped every batch has no measurement at all -- its 0.0
-        # would look like a record improvement and reset the patience counter --
-        # so it does not step.
+
         if n_batches:
             scheduler.step(loss_sup_epoch)
 
-        # None when the epoch saw no labeled target pixels (e.g. only background
-        # labels drawn), so the readout hides rather than shows 0.
         iou = iou_inter / iou_union if iou_union else None
 
-        # The gate: the model has to earn the unsupervised phase by holding the
-        # threshold, and an unscoreable epoch is no evidence that it has, so it
-        # breaks the streak rather than passing silently. A project with no
-        # target labels anywhere therefore never opens the gate and stays
-        # supervised-only -- which is the honest outcome, since there is nothing
-        # to verify the model's own predictions against.
         if gate_epoch is None:
             if iou is not None and iou >= TARGET_IOU_STABILITY:
                 stable_epochs += 1

@@ -6,11 +6,15 @@ Usage: python backend/main.py [path/to/image.tiff | path/to/project_dir]
 import os
 import sys
 
+if sys.platform.startswith("linux"):
+    _bundled_qt_themes = {"gtk3", "xdgdesktopportal"}
+    _requested = os.environ.get("QT_QPA_PLATFORMTHEME", "")
+    if not set(_requested.split(":")) & _bundled_qt_themes:
+        os.environ["QT_QPA_PLATFORMTHEME"] = "xdgdesktopportal:gtk3"
+
 import webview
 
 if getattr(sys, "frozen", False):
-    # PyInstaller bundle: backend/*.py are collected as top-level modules
-    # (already importable) and frontend/dist is bundled under _MEIPASS.
     PROJECT_ROOT = sys._MEIPASS
 else:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
