@@ -1,4 +1,3 @@
-import { CLASSES } from '../constants'
 import Dropdown from './Dropdown'
 
 export default function Toolbar({
@@ -6,7 +5,7 @@ export default function Toolbar({
   onTrain, onStop, onUndo, onAdoptPrediction, onClearLabels, onExportModel,
   onExportOnnx, onExportExecutable, onExportMask, onAccuracyReport, onReset,
   hasProject, onNewProject, onNewFromGeotiff, onSaveProject, onSaveUserMask, onOpenSettings,
-  samAvailable, executableAvailable,
+  samAvailable, executableAvailable, classes,
 }) {
   const training = status?.state === 'training'
   // The gap between the click and the first epoch is backend work, not idleness,
@@ -65,11 +64,11 @@ export default function Toolbar({
       <div className="toolbar-group">
         <span className="group-label">Class</span>
         <div className="segmented">
-          {CLASSES.map((c) => (
+          {classes.map((c) => (
             <button
               key={c.id}
               className={!tool.eraser && tool.classId === c.id ? 'active' : ''}
-              style={{ '--class-color': `rgb(${c.color.join(',')})` }}
+              style={{ '--class-color': c.color }}
               onClick={() => setTool({ ...tool, classId: c.id, eraser: false })}
             >
               <span className="swatch" />
@@ -99,6 +98,13 @@ export default function Toolbar({
             onClick={() => setTool({ ...tool, mode: 'polygon' })}
           >
             Polygon
+          </button>
+          <button
+            className={tool.mode === 'wand' ? 'active' : ''}
+            title="Click a region to select pixels of similar material; Enter paints it"
+            onClick={() => setTool({ ...tool, mode: 'wand' })}
+          >
+            Wand
           </button>
           <button
             className={tool.mode === 'sam' ? 'active' : ''}

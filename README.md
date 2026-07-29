@@ -47,14 +47,17 @@ button stays disabled. The standalone predictor and "Export Executable" need
 
 ### 2. Model Architecture
 
-- Core: U-Net using a timm-efficientnet-b0 encoder.
-- Input: Raw bands, processed in 96×96 patches (default).
+- Core: encoder/decoder net (~5.7M params) trained from scratch — residual
+  depthwise-separable CNN encoder, a small transformer bottleneck at 1/16 scale,
+  and a decoder with skip connections and channel attention.
+- Input: Raw bands, processed in 96×96 patches (default; any multiple of 16).
+- Output: One logit per class per pixel; softmax gives the class probabilities.
 - Inference: Uses overlapping tiles with logit averaging for smooth, full-image results.
 - Sharpening: Optional PointRend head for cleaner boundaries on uncertain pixels.
 
 ### 3. Training Strategy
 
-- Supervised: Standard cross-entropy on user-labeled pixels (user input overrides model).
+- Supervised: Cross-entropy + Dice on user-labeled pixels (user input overrides model).
 - Semi-supervised: FixMatch-style pseudo-labeling on confident (>0.9) predictions.
 - Consistency: MSE between weak/strong augmentations.
 - Gating: the unsupervised terms stay off until the model holds a target IoU of

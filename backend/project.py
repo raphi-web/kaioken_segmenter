@@ -192,9 +192,9 @@ def validate_config(config):
            "'data_profile.input_patch_size' must be [int, int]")
     expect(patch[0] == patch[1],
            "'data_profile.input_patch_size' must be square, e.g. [96, 96]")
-    expect(patch[0] % 32 == 0,
-           "'data_profile.input_patch_size' must be a multiple of 32 "
-           "(the encoder downsamples 32x)")
+    expect(patch[0] % 16 == 0,
+           "'data_profile.input_patch_size' must be a multiple of 16 "
+           "(the encoder downsamples 16x)")
     band_names = profile.get("band_names")
     if band_names is not None:  # optional: older configs don't have it
         expect(isinstance(band_names, list)

@@ -1,4 +1,4 @@
-"""Semi-supervised training: supervised BCE + Lovasz + pseudo-labeling + consistency.
+"""Semi-supervised training: supervised CE + Dice + pseudo-labeling + consistency.
 
 FixMatch-style scheme on patches (size from the image's data profile):
 - a *weak* view (geometric augs, applied jointly to image and label mask) is
@@ -9,22 +9,29 @@ FixMatch-style scheme on patches (size from the image's data profile):
 User-labeled pixels are excluded from the pseudo-label and consistency masks,
 so manual ground truth always overrides model beliefs.
 
-The net emits one logit per pixel with sigmoid(logit) = P(target), so the
-supervised term pairs per-pixel BCE with a Lovasz hinge, which optimizes the
-target IoU directly; the pixel-wise losses keep BCE alone.
+The net emits one logit per class per pixel and the class index is the label
+value, so every target here is a plain (B, H, W) label map with UNLABELED as the
+ignore index. The supervised term pairs per-pixel cross-entropy with a Dice loss,
+which optimizes overlap directly; the pixel-wise losses keep cross-entropy alone.
 """
 
 import albumentations as A
 import numpy as np
 import segmentation_models_pytorch as smp
 import torch
-import torch.nn.functional as F
 from data import UNLABELED
 
 EXCLUDED = 254
 BATCH_SIZE = 16
+LEARNING_RATE = 1e-3
+# The transformer bottleneck trains an order of magnitude slower than the rest
+# of the net. It is the only attention block here and it carries ~80% of the
+# parameters, so at the convolutional rate it is the part that destabilizes
+# first; the CNN encoder/decoder around it is unaffected by its own rate being
+# left alone.
+BOTTLENECK_LR = 5e-5
 CONFIDENCE_THRESHOLD = 0.92
-LAMBDA_LOVASZ = 1.0
+LAMBDA_DICE = 1.0
 LAMBDA_PSEUDO = 0.5
 LAMBDA_CONSISTENCY = 1.0
 # The unsupervised phase is gated on the model being demonstrably good rather
@@ -32,7 +39,7 @@ LAMBDA_CONSISTENCY = 1.0
 # model's own predictions are. The threshold is read against the same live
 # target IoU the run reports, which is measured on the strongly-augmented view
 # and so sits below what the model scores on clean imagery.
-TARGET_IOU_STABILITY = 0.65  # live target IoU the model must reach...
+TARGET_IOU_STABILITY = 0.70  # live target IoU the model must reach...
 STABILITY_PATIENCE = 3  # ...and hold for this many consecutive epochs
 # Once the gate opens the ramp spans a share of whatever training is left
 # instead of a fixed count, so a long run fades the terms in slowly.
@@ -279,16 +286,31 @@ def train(model, samples, epochs, progress=None, stop_event=None):
     net = model.net
     device = model.device
 
-    lovasz = smp.losses.LovaszLoss(mode="binary", ignore_index=UNLABELED)
+    # reduction="sum" and an explicit divide by the valid-pixel count: smp's
+    # cross-entropy averages over *all* pixels, counting the ignored ones as
+    # zero, which on mostly-unlabeled patches would scale the supervised loss
+    # (and with it the effective learning rate) toward zero.
+    cross_entropy = smp.losses.SoftCrossEntropyLoss(
+        reduction="sum", smooth_factor=0.0, ignore_index=UNLABELED
+    )
+    dice = smp.losses.DiceLoss(
+        mode="multiclass", ignore_index=UNLABELED, from_logits=True
+    )
 
+    def masked_ce(logits, target, mask):
+        """Cross-entropy averaged over the pixels `mask` selects (0.0 if none)."""
+        return cross_entropy(logits, target) / mask.sum().clamp(min=1)
+
+    # The convolutional encoder/decoder trains at LEARNING_RATE; the transformer
+    # bottleneck alone gets BOTTLENECK_LR. Everything else is one group because
+    # nothing here is pretrained, so there is no reason to stagger it.
+    bottleneck = list(net.bottleneck.parameters())
+    bottleneck_ids = {id(p) for p in bottleneck}
+    rest = [p for p in net.parameters() if id(p) not in bottleneck_ids]
     param_groups = [
-        {"params": net.unet.encoder.parameters(), "lr": 1e-3},
-        {"params": net.unet.decoder.parameters(), "lr": 2e-3},
-        {"params": net.unet.segmentation_head.parameters(), "lr": 2e-3},
+        {"params": rest, "lr": LEARNING_RATE},
+        {"params": bottleneck, "lr": BOTTLENECK_LR},
     ]
-    if getattr(net, "point_head", None) is not None:
-
-        param_groups.append({"params": net.point_head.parameters(), "lr": 2e-3})
 
     optimizer = torch.optim.AdamW(param_groups)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -312,7 +334,7 @@ def train(model, samples, epochs, progress=None, stop_event=None):
             )
 
             ramp = min(1.0, (epoch - gate_epoch + 1) / ramp_epochs)
-        sums = {"sup": 0.0, "lov": 0.0, "pseudo": 0.0, "cons": 0.0}
+        sums = {"sup": 0.0, "dice": 0.0, "pseudo": 0.0, "cons": 0.0}
         n_batches = 0
         iou_inter = 0.0  # target-class intersection/union over labeled pixels,
         iou_union = 0.0  # accumulated across the epoch for a live IoU readout
@@ -331,54 +353,47 @@ def train(model, samples, epochs, progress=None, stop_event=None):
             ):
                 strong, mask = strong.to(device), mask.to(device)
 
-                mask = mask.unsqueeze(
-                    1
-                )
-                logits = net(strong)
+                logits = net(strong)  # (B, classes, H, W); mask is (B, H, W)
 
-                sup_target = mask.masked_fill(mask == EXCLUDED, UNLABELED)
+                sup_target = mask.masked_fill(mask == EXCLUDED, UNLABELED).long()
                 labeled = sup_target != UNLABELED
 
-                target = (sup_target == 0).float()
-
                 with torch.no_grad():
-                    pred_t = (logits > 0) & labeled
-                    gt_t = (target > 0.5) & labeled
+                    pred_t = (logits.argmax(1) == TARGET) & labeled
+                    gt_t = (sup_target == TARGET) & labeled
                     iou_inter += (pred_t & gt_t).sum().item()
                     iou_union += (pred_t | gt_t).sum().item()
                 if labeled.any():
-                    loss_sup = F.binary_cross_entropy_with_logits(
-                        logits, target, reduction="none"
-                    )[labeled].mean()
+                    loss_sup = masked_ce(logits, sup_target, labeled)
                 else:
                     loss_sup = logits.sum() * 0.0
-                loss_lov = lovasz(
-                    logits.squeeze(1),
-                    torch.where(labeled, target.long(), sup_target).squeeze(1),
-                )
+                loss_dice = dice(logits, sup_target)
 
-                loss = loss_sup + LAMBDA_LOVASZ * loss_lov
+                loss = loss_sup + LAMBDA_DICE * loss_dice
 
                 if not warmup:
                     weak = weak.to(device)
                     with torch.no_grad():
                         net.eval()
-                        weak_probs = torch.sigmoid(net(weak))  # P(target)
+                        weak_probs = torch.softmax(net(weak), dim=1)
                         net.train()
-                    strong_probs = torch.sigmoid(logits)
+                    strong_probs = torch.softmax(logits, dim=1)
 
-                    conf = torch.maximum(weak_probs, 1.0 - weak_probs)
-                    pseudo = (weak_probs > 0.5).float()
+                    # conf/pseudo are (B, H, W): the winning class and its
+                    # probability, so the threshold keeps its meaning.
+                    conf, pseudo = weak_probs.max(dim=1)
                     unlabeled = mask == UNLABELED
                     pseudo_mask = unlabeled & (conf > CONFIDENCE_THRESHOLD)
                     if pseudo_mask.any():
-                        loss_pseudo = F.binary_cross_entropy_with_logits(
-                            logits, pseudo, reduction="none"
-                        )[pseudo_mask].mean()
+                        loss_pseudo = masked_ce(
+                            logits,
+                            pseudo.masked_fill(~pseudo_mask, UNLABELED),
+                            pseudo_mask,
+                        )
                     else:
                         loss_pseudo = logits.sum() * 0.0
 
-                    per_px = (strong_probs - weak_probs) ** 2
+                    per_px = ((strong_probs - weak_probs) ** 2).mean(dim=1)
                     loss_cons = (
                         per_px[unlabeled].mean()
                         if unlabeled.any()
@@ -392,7 +407,7 @@ def train(model, samples, epochs, progress=None, stop_event=None):
                 optimizer.step()
 
                 sums["sup"] += loss_sup.detach().item()
-                sums["lov"] += loss_lov.detach().item()
+                sums["dice"] += loss_dice.detach().item()
                 if not warmup:
                     sums["pseudo"] += loss_pseudo.detach().item()
                     sums["cons"] += loss_cons.detach().item()
@@ -400,7 +415,7 @@ def train(model, samples, epochs, progress=None, stop_event=None):
             del image, labels  # bound memory: one image resident at a time
 
         denom = n_batches or 1
-        loss_sup_epoch = (sums["sup"] + LAMBDA_LOVASZ * sums["lov"]) / denom
+        loss_sup_epoch = (sums["sup"] + LAMBDA_DICE * sums["dice"]) / denom
 
 
         if n_batches:

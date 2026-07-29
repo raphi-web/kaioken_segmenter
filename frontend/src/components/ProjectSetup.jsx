@@ -34,7 +34,7 @@ export default function ProjectSetup({ mode = 'create', root, source, defaults, 
   }))
   const editing = mode === 'edit'
   const tiling = mode === 'geotiff'
-  const patchInvalid = !form.input_patch_size || form.input_patch_size % 32 !== 0
+  const patchInvalid = !form.input_patch_size || form.input_patch_size % 16 !== 0
 
   // Tile validity: a tile smaller than the model patch yields images that
   // SentinelImage refuses to open, and the overlap must leave a forward step.
@@ -97,6 +97,13 @@ export default function ProjectSetup({ mode = 'create', root, source, defaults, 
       display_bands[channel] = index
       return { ...f, display_bands }
     })
+  }
+
+  function setClassColor(id, color) {
+    setForm((f) => ({
+      ...f,
+      classes: f.classes.map((c) => (c.id === id ? { ...c, color } : c)),
+    }))
   }
 
   // Re-probe the band count when the images folder changes (create only: in
@@ -269,13 +276,13 @@ export default function ProjectSetup({ mode = 'create', root, source, defaults, 
             type="number"
             min="32"
             max="512"
-            step="32"
+            step="16"
             value={form.input_patch_size}
             disabled={editing}
             onChange={(e) => set('input_patch_size', Number(e.target.value))}
           />
           <span className={patchInvalid ? 'modal-error' : 'hint'}>
-            {editing ? 'fixed for this project' : 'px, multiple of 32'}
+            {editing ? 'fixed for this project' : 'px, multiple of 16'}
           </span>
         </div>
 
@@ -311,6 +318,24 @@ export default function ProjectSetup({ mode = 'create', root, source, defaults, 
           />
           <span className="hint">PointRend point head on uncertain pixels</span>
         </div>
+
+        {editing && form.classes && (
+          <div className="form-row">
+            <label>Class colors</label>
+            <div className="class-colors">
+              {form.classes.map((c) => (
+                <div key={c.id} className="class-color">
+                  <input
+                    type="color"
+                    value={c.color}
+                    onChange={(e) => setClassColor(c.id, e.target.value)}
+                  />
+                  <span>{c.name}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="form-row">
           <label>User masks folder</label>

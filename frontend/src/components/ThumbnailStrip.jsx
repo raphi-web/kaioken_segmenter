@@ -2,12 +2,14 @@
 // image in both panes, right-click one to move it between the training and
 // validation sets. Thumbnails stream in while the backend generates them.
 
-function Thumbnail({ name, thumb, active, validation, disabled, onSelect, onContextMenu }) {
+import { forwardRef, useImperativeHandle, useRef } from 'react'
+
+function Thumbnail({ name, thumb, active, validation, disabled, onSelect, onContextMenu, slotRef }) {
   // The context handler sits on the wrapper, not the button: the button is
   // disabled while training runs, and disabled buttons fire no mouse events at
   // all — the browser's own menu would appear instead of ours.
   return (
-    <div className="thumb-slot" onContextMenu={onContextMenu}>
+    <div className="thumb-slot" ref={slotRef} onContextMenu={onContextMenu}>
       <button
         className={`thumb${active ? ' active' : ''}${validation ? ' validation' : ''}`}
         disabled={disabled}
@@ -24,9 +26,20 @@ function Thumbnail({ name, thumb, active, validation, disabled, onSelect, onCont
   )
 }
 
-export default function ThumbnailStrip({
+// Exposes centerOn(name) via ref so callers outside the strip (the accuracy
+// report's "jump to image") can scroll a thumbnail into view without the
+// strip re-centering on every ordinary click, which would feel jumpy.
+const ThumbnailStrip = forwardRef(function ThumbnailStrip({
   images, thumbs, activeName, validation, progress, disabled, onSelect, onContextMenu,
-}) {
+}, ref) {
+  const nodes = useRef(new Map())
+
+  useImperativeHandle(ref, () => ({
+    centerOn(name) {
+      nodes.current.get(name)?.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' })
+    },
+  }), [])
+
   if (!images?.length) return null
   const held = new Set(validation ?? [])
 
@@ -51,6 +64,10 @@ export default function ThumbnailStrip({
             e.preventDefault()
             onContextMenu(name, e.clientX, e.clientY)
           }}
+          slotRef={(el) => {
+            if (el) nodes.current.set(name, el)
+            else nodes.current.delete(name)
+          }}
         />
       ))}
       {progress?.running && (
@@ -60,4 +77,6 @@ export default function ThumbnailStrip({
       )}
     </div>
   )
-}
+})
+
+export default ThumbnailStrip

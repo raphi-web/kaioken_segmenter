@@ -11,11 +11,20 @@
 # PyInstaller hooks (via pyinstaller-hooks-contrib / their own package), so
 # only rasterio -- which has none -- needs a manual collect_all.
 
+import os
+
 from PyInstaller.utils.hooks import collect_all
 
 datas, binaries, hiddenimports = collect_all("rasterio")
 
 datas += [("frontend/dist", "frontend/dist")]
+
+# Pretrained weights (model.DEFAULT_WEIGHTS), so the packaged app starts from
+# the same initialization as the source tree instead of from scratch. Optional:
+# the load is skipped when the file is absent, which keeps the build working for
+# anyone who does not have it.
+if os.path.exists("pretraining/pretrained.pth"):
+    datas += [("pretraining/pretrained.pth", "pretraining")]
 
 # backend/*.py import each other as top-level modules (main.py adds
 # backend/ to sys.path at runtime); pathex below lets Analysis find them,

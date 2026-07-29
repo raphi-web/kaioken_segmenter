@@ -462,6 +462,78 @@ body {
   margin-left: 4px;
 }
 
+.hint.warn {
+  color: var(--danger);
+}
+
+/* ---------- magic wand ---------- */
+
+/* The wand's own row under the pane title: the title bar already overflowed at
+   three sliders, so the controls get their own line and the title keeps the
+   readout. */
+.wand-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.wand-controls .spacer {
+  flex: 1;
+}
+
+.wand-slider {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.wand-slider input[type='range'] {
+  width: 96px;
+  accent-color: var(--accent);
+}
+
+.wand-slider-name {
+  color: var(--text-mute);
+}
+
+/* Tabular figures and a fixed width so the row does not jitter as the readout
+   changes width while a slider is dragged. */
+.wand-slider-value {
+  min-width: 52px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.wand-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.wand-toggle input {
+  accent-color: var(--accent);
+}
+
+.wand-toggle:has(input:disabled) {
+  opacity: 0.5;
+}
+
+.segmented.compact button {
+  padding: 2px 7px;
+  font-size: 11px;
+}
+
+/* Above the label canvas, so the pending selection reads over painted labels;
+   never a pointer target, since every click belongs to the canvas beneath. */
+.wand-preview {
+  pointer-events: none;
+}
+
 /* ---------- project setup modal ---------- */
 
 .modal-backdrop {
@@ -669,6 +741,29 @@ body {
 .rgb-g { background: #46a758; }
 .rgb-b { background: #3c8cff; }
 
+.class-colors {
+  flex: 1;
+  display: flex;
+  gap: 16px;
+  min-width: 0;
+}
+
+.class-color {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.class-color input[type="color"] {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+}
+
 .modal-error {
   color: var(--danger);
 }
@@ -822,6 +917,7 @@ div.modal-error {
   width: 100%;
   background: transparent;
   border-color: transparent;
+  color: #fff;
 }
 
 .context-menu button:hover:not(:disabled) {
@@ -830,9 +926,18 @@ div.modal-error {
   color: var(--accent);
 }
 
+.context-menu button.danger {
+  color: #fff;
+}
+
+.context-menu button.danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}
+
 .context-title {
   padding: 2px 8px 5px;
-  color: var(--text-mute);
+  color: #fff;
   font-family: var(--font-mono);
   font-size: 11px;
   border-bottom: 1px solid var(--border);
@@ -965,8 +1070,25 @@ div.modal-error {
   font-weight: 500;
 }
 
+.report-table th.sortable {
+  cursor: pointer;
+}
+
+.report-table th.sortable:hover {
+  color: var(--text);
+}
+
 .report-table td.mono {
   font-family: var(--font-mono);
+}
+
+.report-table td.mono.clickable {
+  cursor: pointer;
+}
+
+.report-table td.mono.clickable:hover {
+  color: var(--accent);
+  text-decoration: underline;
 }
 
 .report-table tr.dim td {

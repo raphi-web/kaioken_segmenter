@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api, fromBase64, toBase64 } from './bridge'
-import { UNLABELED } from './constants'
+import { CLASSES, UNLABELED, hexToRgb } from './constants'
 import AccuracyReport from './components/AccuracyReport'
 import ContextMenu from './components/ContextMenu'
 import InferencePane from './components/InferencePane'
@@ -49,6 +49,7 @@ export default function App() {
   const autosaveTimer = useRef(null)
   const showUncertaintyRef = useRef(false)
   const prevState = useRef('idle')
+  const thumbStripRef = useRef(null)
 
   // Install a backend image payload (base image + its persisted labels) and
   // reset all per-image UI state.
@@ -209,6 +210,25 @@ export default function App() {
     return res.polygons
   }
 
+  // Magic wand: resolve the pending clicks into a selection mask. Returns the
+  // backend's counts with the bit-packed mask unpacked into a byte-per-pixel
+  // Uint8Array the preview and the commit both consume, or null on error.
+  // Source-agnostic on purpose -- it forwards whatever options it is handed.
+  async function handleWandSelect(samples, options) {
+    setMessage('')
+    const res = await api('wand_select', samples.map((p) => [p.x, p.y]), options)
+    if (!res.ok) {
+      if (res.error) setMessage(res.error)
+      return null
+    }
+    const packed = fromBase64(res.mask)
+    const mask = new Uint8Array(res.width * res.height)
+    for (let i = 0; i < mask.length; i++) {
+      mask[i] = (packed[i >> 3] >> (7 - (i & 7))) & 1
+    }
+    return { ...res, mask }
+  }
+
   // Reset every labeled pixel of the current image to unlabeled, undoably.
   async function handleClearLabels() {
     const labels = labelsRef.current
@@ -259,6 +279,29 @@ export default function App() {
     const res = await api('set_image_role', name, role)
     if (res.ok) setProject(res.project)
     else if (res.error) setMenuError(res.error)
+  }
+
+  // Permanently remove an image (and its masks/thumbnail) from disk. When the
+  // deleted image was active, the backend hands back whatever replaces it
+  // (another image, or null once the project is empty).
+  async function handleDeleteImage(name) {
+    setMenuError('')
+    const res = await api('delete_image', name)
+    if (!res.ok) {
+      if (res.error) setMenuError(res.error)
+      return
+    }
+    setProject(res.project)
+    setThumbs((t) => {
+      if (!(name in t)) return t
+      const next = { ...t }
+      delete next[name]
+      return next
+    })
+    if ('image' in res) {
+      applyImagePayload(res.image)
+      if (res.image_error) setMessage(res.image_error)
+    }
   }
 
   // Score the model over every labeled image. Runs on a backend worker (it can
@@ -351,6 +394,7 @@ export default function App() {
         masks_user: project.paths.masks_user,
         masks_ai: project.paths.masks_ai,
         bands_detected: true,
+        classes: project.classes,
       },
     })
   }
@@ -396,6 +440,10 @@ export default function App() {
         setProject(res.project)
         // Only the display bands changed: swap the base RGB, keep labels/view.
         if (res.image) setImage((img) => (img ? { ...img, png: res.image.png } : img))
+        // The AI overlay is colorized on the backend, so a class-color edit
+        // needs a refetch to show up (the client-drawn labels update on their
+        // own from the new `project.classes` passed down as classColors).
+        refreshOverlays()
         setMessage('Settings saved')
       }
     } else {
@@ -414,6 +462,20 @@ export default function App() {
     applyImagePayload(res.image)
     setProject((p) => (p ? { ...p, active: name } : p))
   }
+
+  // Double-clicking a filename in the accuracy report jumps to that image:
+  // close the report so the switched-to image is visible underneath, and
+  // scroll the thumbnail strip to it since it may be far outside the view.
+  async function handleOpenReportImage(name) {
+    await handleSelectImage(name)
+    setReport(null)
+    thumbStripRef.current?.centerOn(name)
+  }
+
+  // The open project's own class palette (colors editable in Settings), or
+  // the standalone-image default when no project is open.
+  const classes = project?.classes ?? CLASSES
+  const classColors = Object.fromEntries(classes.map((c) => [c.id, hexToRgb(c.color)]))
 
   return (
     <div className="app">
@@ -445,6 +507,7 @@ export default function App() {
         onOpenSettings={handleOpenSettings}
         samAvailable={samAvailable}
         executableAvailable={executableAvailable}
+        classes={classes}
       />
       <div className="panes">
         <InferencePane
@@ -467,9 +530,14 @@ export default function App() {
           onStrokeEnd={pushLabels}
           onDiff={recordUndo}
           onSamSnap={handleSamSnap}
+          onWandSelect={handleWandSelect}
+          classColors={classColors}
+          classes={classes}
+          samAvailable={samAvailable}
         />
       </div>
       <ThumbnailStrip
+        ref={thumbStripRef}
         images={project?.images}
         thumbs={thumbs}
         activeName={image?.name}
@@ -492,6 +560,16 @@ export default function App() {
             : <button onClick={() => handleSetRole(menu.name, 'validation')}>
                 Set image to validation
               </button>}
+          <button
+            className="danger"
+            onClick={() => {
+              if (window.confirm(`Delete "${menu.name}"? This removes the image and its masks from disk.`)) {
+                handleDeleteImage(menu.name)
+              }
+            }}
+          >
+            Delete image
+          </button>
         </ContextMenu>
       )}
       {menuError && <div className="floating-error">{menuError}</div>}
@@ -503,6 +581,7 @@ export default function App() {
           onSave={() => handleExport('save_accuracy_report')}
           onCancel={() => api('cancel_accuracy_report')}
           onClose={() => setReport(null)}
+          onOpenImage={handleOpenReportImage}
         />
       )}
       {setup && (

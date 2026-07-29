@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { CLASS_COLORS, LABEL_ALPHA, UNLABELED } from '../constants'
+import {
+  LABEL_ALPHA, UNLABELED, WAND_EDGE_ALPHA, WAND_EDGE_DARK, WAND_EDGE_LIGHT,
+  WAND_PREVIEW_ALPHA, WAND_SAM_TOL_MIN, WAND_SAM_TOL_SPAN, WAND_TOL_SCALE,
+  WAND_WARN_FRACTION, wandBudget, wandToleranceSeed,
+} from '../constants'
 import Viewport from './Viewport'
 
 // Chromium (and Qt WebEngine) ignores custom CSS cursors larger than 128px, so
@@ -70,6 +74,30 @@ function makeCrosshairCursor(color) {
   return canvasCursor(canvas)
 }
 
+// One labelled wand slider with its readout. All three respond to the scroll
+// wheel, like the overlay-opacity control above them.
+function WandSlider({ label, value, min, max, readout, onChange }) {
+  const step = (delta) => onChange(Math.min(max, Math.max(min, value + delta)))
+  return (
+    <label className="wand-slider">
+      <span className="wand-slider-name">{label}</span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step="1"
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        onWheel={(e) => {
+          e.preventDefault()
+          step(e.deltaY < 0 ? 1 : -1)
+        }}
+      />
+      <span className="wand-slider-value">{readout}</span>
+    </label>
+  )
+}
+
 // Right pane: base RGB image with a brush-paintable label canvas on top.
 // Labels live in a Uint8Array (values 0/1/UNLABELED); the canvas is a
 // colorized rendering of that array, redrawn per stroke segment.
@@ -79,6 +107,7 @@ function makeCrosshairCursor(color) {
 // the app can undo it.
 export default function LabelerPane({
   image, labels, labelsVersion, tool, view, setView, onStrokeEnd, onDiff, onSamSnap,
+  onWandSelect, classColors, classes, samAvailable,
 }) {
   const canvasRef = useRef(null)
   const [canvasReady, setCanvasReady] = useState(false)
@@ -110,6 +139,40 @@ export default function LabelerPane({
   const samUndoRef = useRef(() => {})
   const samCancelRef = useRef(() => {})
 
+  // ---------- magic wand ----------
+  // Pending selection: the clicks so far ({x, y, label}, 1 = include /
+  // 0 = exclude) and the mask they currently produce, previewed on its own
+  // canvas. Nothing touches the labels until Enter.
+  const wandCanvasRef = useRef(null)
+  const [wandSamples, setWandSamples] = useState([])
+  const wandSamplesRef = useRef(wandSamples)
+  wandSamplesRef.current = wandSamples
+  const wandMaskRef = useRef(null)
+  // Only the tolerances the user has actually moved; anything untouched falls
+  // through to that class's measured seed, so a fresh class starts on evidence
+  // rather than on whatever the last class happened to need.
+  const [wandTolerances, setWandTolerances] = useState({})
+  const [wandSam, setWandSam] = useState(false)
+  const wandSamRef = useRef(wandSam)
+  wandSamRef.current = wandSam
+  const [wandSamTolerance, setWandSamTolerance] = useState(50)
+  const [wandLevel, setWandLevel] = useState('fine')
+  const [wandBudgetStep, setWandBudgetStep] = useState(100)
+  const [wandSampleSize, setWandSampleSize] = useState(9)
+  const [wandProtect, setWandProtect] = useState(true)
+  const [wandGlobal, setWandGlobal] = useState(false)
+  const [wandStats, setWandStats] = useState(null) // {count, available, ...}
+  const [wandBusy, setWandBusy] = useState(false)
+  const wandSeq = useRef(0)
+  const wandCommitRef = useRef(() => {})
+  const wandUndoRef = useRef(() => {})
+  const wandCancelRef = useRef(() => {})
+
+  const wandClassName = classes?.find((c) => c.id === tool.classId)?.name
+  const wandTolerance = wandTolerances[tool.classId] ?? wandToleranceSeed(wandClassName)
+  const wandRunaway = !!wandStats
+    && wandStats.count > WAND_WARN_FRACTION * Math.max(wandStats.valid, 1)
+
   // Callback ref: the canvas only mounts once the Viewport has a `view`
   // (see Viewport), which lands after image/labels are already set. Track the
   // node's presence so the redraw effect can paint the persisted mask the
@@ -121,7 +184,7 @@ export default function LabelerPane({
 
   useEffect(() => {
     if (image && canvasReady) redraw()
-  }, [image, labels, labelsVersion, canvasReady, opacity])
+  }, [image, labels, labelsVersion, canvasReady, opacity, classColors])
 
   // Leaving polygon mode discards an unfinished polygon.
   useEffect(() => {
@@ -129,22 +192,49 @@ export default function LabelerPane({
     // Leaving SAM2 mode drops an uncommitted selection rather than leaving an
     // invisible one to be committed later by a stray Enter.
     if (tool.mode !== 'sam') samCancelRef.current()
+    if (tool.mode !== 'wand') wandCancelRef.current()
   }, [tool.mode])
 
-  // Enter commits the pending shape (polygon fill / SAM2 selection), Escape
-  // cancels it; in SAM2 mode Backspace drops just the last click.
+  // Switching images drops the pending selection. The canvas resets itself when
+  // its width/height change, but the mask behind it would not: a stray Enter
+  // could otherwise paint the previous image's selection onto this one.
+  useEffect(() => {
+    wandCancelRef.current()
+  }, [image?.name])
+
+  // Any change to what the selection MEANS re-runs the pending clicks rather
+  // than clearing them. For the class and the source that is a correctness
+  // requirement: the tolerance changes with both, so the preview would
+  // otherwise be the one the old threshold produced while the slider reads the
+  // new number, and Enter would commit a mask matching neither. For the level
+  // it is the point of the selector — the three are only comparable on the
+  // same click.
+  //
+  // Runs as an effect, not from the change handlers, so wandRun always closes
+  // over the state as it is AFTER the change. Dragging a slider is cheap: the
+  // backend caches its distance fields per click, so a re-run at a new
+  // tolerance is a threshold pass, not a re-measure.
+  useEffect(() => {
+    if (tool.mode !== 'wand') return
+    if (wandSamplesRef.current.some((p) => p.label)) wandRun(wandSamplesRef.current)
+  }, [tool.classId, tool.eraser, wandTolerance, wandSam, wandSamTolerance, wandLevel,
+      wandBudgetStep, wandSampleSize, wandProtect, wandGlobal])
+
+  // Enter commits the pending shape (polygon fill / SAM2 / wand selection),
+  // Escape cancels it; Backspace drops just the last click.
   useEffect(() => {
     function onKey(e) {
       const mode = settings.current.mode
       if (mode === 'polygon') {
         if (e.key === 'Enter') closeRef.current()
         else if (e.key === 'Escape') setVerts([])
-      } else if (mode === 'sam') {
-        if (e.key === 'Enter') samCommitRef.current()
-        else if (e.key === 'Escape') samCancelRef.current()
+      } else if (mode === 'sam' || mode === 'wand') {
+        const wand = mode === 'wand'
+        if (e.key === 'Enter') (wand ? wandCommitRef : samCommitRef).current()
+        else if (e.key === 'Escape') (wand ? wandCancelRef : samCancelRef).current()
         else if (e.key === 'Backspace') {
           e.preventDefault() // otherwise the webview treats it as "go back"
-          samUndoRef.current()
+          ;(wand ? wandUndoRef : samUndoRef).current()
         }
       }
     }
@@ -160,8 +250,8 @@ export default function LabelerPane({
     const imgData = ctx.createImageData(width, height)
     for (let i = 0; i < labels.length; i++) {
       const v = labels[i]
-      if (!(v in CLASS_COLORS)) continue
-      const [r, g, b] = CLASS_COLORS[v]
+      if (!(v in classColors)) continue
+      const [r, g, b] = classColors[v]
       const o = i * 4
       imgData.data[o] = r
       imgData.data[o + 1] = g
@@ -330,6 +420,147 @@ export default function LabelerPane({
   }
   samCommitRef.current = samCommit
 
+  // Re-run the wand over the whole pending click list. Every click recomputes
+  // from scratch: the backend resolves each sample independently and unions the
+  // results, so the mask a click set implies never depends on the order they
+  // arrived in.
+  async function wandRun(samples) {
+    if (!samples.length) {
+      wandMaskRef.current = null
+      setWandStats(null)
+      drawWandPreview(null)
+      return
+    }
+    const seq = ++wandSeq.current
+    setWandBusy(true)
+    const sam = wandSamRef.current
+    try {
+      const res = await onWandSelect(samples.filter((p) => p.label), {
+        tolerance: sam
+          ? WAND_SAM_TOL_MIN + (wandSamTolerance / 100) * WAND_SAM_TOL_SPAN
+          : wandTolerance / WAND_TOL_SCALE,
+        source: sam ? 'sam' : 'image',
+        level: wandLevel,
+        max_pixels: wandBudget(wandBudgetStep),
+        sample_size: wandSampleSize,
+        negatives: samples.filter((p) => !p.label).map((p) => [p.x, p.y]),
+        global: wandGlobal,
+        // The eraser only ever acts on labeled pixels, so protecting them would
+        // make it a no-op. The caller decides, not the backend.
+        protect: wandProtect && !settings.current.eraser,
+      })
+      if (seq !== wandSeq.current) return // a newer click already superseded this
+      if (res) {
+        wandMaskRef.current = res.mask
+        setWandStats(res)
+        drawWandPreview(res.mask)
+      }
+      // A failed request keeps the previous preview rather than blanking it, so
+      // a stray click does not throw away a good selection.
+    } finally {
+      if (seq === wandSeq.current) setWandBusy(false)
+    }
+  }
+
+  // A positive click needs at least one include sample to grow from; a lone
+  // negative has nothing to subtract from, so it just waits for one.
+  function wandAddSample(pos, label) {
+    const next = [...wandSamplesRef.current, { x: Math.floor(pos.x), y: Math.floor(pos.y), label }]
+    wandSamplesRef.current = next
+    setWandSamples(next)
+    if (next.some((p) => p.label)) wandRun(next)
+  }
+
+  function wandUndoSample() {
+    const next = wandSamplesRef.current.slice(0, -1)
+    wandSamplesRef.current = next
+    setWandSamples(next)
+    wandRun(next.some((p) => p.label) ? next : [])
+  }
+
+  function wandCancel() {
+    wandSeq.current++ // abandon any in-flight request
+    wandSamplesRef.current = []
+    setWandSamples([])
+    wandMaskRef.current = null
+    setWandStats(null)
+    setWandBusy(false)
+    drawWandPreview(null)
+  }
+  wandUndoRef.current = wandUndoSample
+  wandCancelRef.current = wandCancel
+
+  // Paint the selection into the label buffer as ONE undoable diff.
+  function wandCommit() {
+    const mask = wandMaskRef.current
+    if (!mask) return
+    const { classId, eraser } = settings.current
+    const value = eraser ? UNLABELED : classId
+    const diff = new Map()
+    for (let i = 0; i < mask.length; i++) {
+      if (mask[i]) paintPixel(diff, i, value)
+    }
+    wandCancel()
+    if (diff.size) {
+      onDiff(diff)
+      redraw()
+      onStrokeEnd()
+    }
+  }
+  wandCommitRef.current = wandCommit
+
+  // Fill in the class colour, then a two-tone boundary on top of it. The fill
+  // alone is not enough: it is the class colour, so Snow over bright terrain or
+  // Meadow over a yellow-green field is nearly invisible. One edge tone is not
+  // enough either — a light outline vanishes on Snow, a dark one vanishes in
+  // shadow — so selected edge pixels get the light tone and the unselected
+  // pixels touching them get the dark one, and the pair reads on both.
+  function drawWandPreview(mask) {
+    const canvas = wandCanvasRef.current
+    if (!canvas || !image) return
+    const { width, height } = image
+    const ctx = canvas.getContext('2d')
+    ctx.clearRect(0, 0, width, height)
+    if (!mask) return
+    const img = ctx.createImageData(width, height)
+    const data = img.data
+    const { classId, eraser } = settings.current
+    const [r, g, b] = eraser ? [255, 255, 255] : (classColors[classId] ?? [255, 255, 255])
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = y * width + x
+        const o = i * 4
+        const on = mask[i]
+        // Image-border pixels count as edge, so a selection running off the
+        // edge still reads as bounded rather than as trailing away.
+        const up = y > 0 ? mask[i - width] : !on
+        const down = y < height - 1 ? mask[i + width] : !on
+        const left = x > 0 ? mask[i - 1] : !on
+        const right = x < width - 1 ? mask[i + 1] : !on
+        if (on) {
+          const edge = !up || !down || !left || !right
+          if (edge) {
+            data[o] = WAND_EDGE_LIGHT
+            data[o + 1] = WAND_EDGE_LIGHT
+            data[o + 2] = WAND_EDGE_LIGHT
+            data[o + 3] = WAND_EDGE_ALPHA
+          } else {
+            data[o] = r
+            data[o + 1] = g
+            data[o + 2] = b
+            data[o + 3] = WAND_PREVIEW_ALPHA
+          }
+        } else if (up || down || left || right) {
+          data[o] = WAND_EDGE_DARK
+          data[o + 1] = WAND_EDGE_DARK
+          data[o + 2] = WAND_EDGE_DARK
+          data[o + 3] = WAND_EDGE_ALPHA
+        }
+      }
+    }
+    ctx.putImageData(img, 0, 0)
+  }
+
   // Oversized-brush fallback circle (see cursorCss): only mounted when the
   // brush is too big for a native CSS cursor. The stack's CSS space is the
   // image scaled by the zoom (layout scaling, see Viewport), so image
@@ -350,6 +581,17 @@ export default function LabelerPane({
 
   function onPointerDown(e) {
     if (!image) return
+    if (settings.current.mode === 'wand') {
+      // Same gesture language as SAM2 mode: left includes, right (or
+      // Ctrl/Alt+left, for trackpads that swallow secondary click) excludes.
+      if (e.button === 2) {
+        e.preventDefault()
+        wandAddSample(canvasPos(e), 0)
+      } else if (e.button === 0) {
+        wandAddSample(canvasPos(e), e.ctrlKey || e.altKey ? 0 : 1)
+      }
+      return
+    }
     if (settings.current.mode === 'sam') {
       // Left click includes, right click (or Ctrl/Alt+left) excludes. Right
       // click is the primary gesture because it needs no second hand; the
@@ -394,20 +636,23 @@ export default function LabelerPane({
     onStrokeEnd()
   }
 
-  const brushColor = tool.eraser ? [255, 255, 255] : CLASS_COLORS[tool.classId]
+  const brushColor = tool.eraser ? [255, 255, 255] : classColors[tool.classId]
   const polygonMode = tool.mode === 'polygon'
   const samMode = tool.mode === 'sam'
+  const wandMode = tool.mode === 'wand'
 
   // Brush cursor: draw it into a native CSS cursor (zero pointer lag) while it
   // fits the browser's 128px cap; beyond that, fall back to the DOM circle.
   const scale = view?.scale ?? 1
   const oversized = Math.ceil(tool.brushSize * 2 * scale) + CURSOR_PAD * 2 > MAX_CURSOR_PX
   const cursorCss = useMemo(() => {
+    if (wandMode) return wandBusy ? 'wait' : 'crosshair'
     if (samMode) return samBusy ? 'wait' : 'crosshair'
     if (polygonMode) return 'crosshair'
-    const color = tool.eraser ? [255, 255, 255] : CLASS_COLORS[tool.classId]
+    const color = tool.eraser ? [255, 255, 255] : classColors[tool.classId]
     return makeBrushCursor(tool.brushSize * 2 * scale, color) ?? makeCrosshairCursor(color)
-  }, [tool.brushSize, scale, tool.eraser, tool.classId, polygonMode, samMode, samBusy])
+  }, [tool.brushSize, scale, tool.eraser, tool.classId, polygonMode, samMode, samBusy,
+      wandMode, wandBusy, classColors])
 
   return (
     <div className="pane">
@@ -424,6 +669,23 @@ export default function LabelerPane({
               : samPoints.length
                 ? 'right-click: exclude · left-click: include · Backspace: undo point · Enter: fill · Esc: cancel'
                 : 'click an object · then right-click parts to exclude them'}
+          </span>
+        )}
+        {wandMode && (
+          <span className={wandRunaway ? 'hint warn' : 'hint'}>
+            {wandBusy ? (wandSam ? 'SAM2 encoding…' : 'selecting…')
+              : wandStats
+                ? [
+                    `${wandSamples.length} click${wandSamples.length === 1 ? '' : 's'}`,
+                    `${wandStats.count.toLocaleString()} px`,
+                    `${(100 * wandStats.count / Math.max(wandStats.valid, 1)).toFixed(1)}%`,
+                    wandStats.capped
+                      && `capped of ${wandStats.available.toLocaleString()}`,
+                    wandStats.protected
+                      && `${wandStats.protected.toLocaleString()} protected`,
+                    wandRunaway && 'runaway — narrow the tolerance',
+                  ].filter(Boolean).join(' · ')
+                : 'click a region · right-click to exclude · Enter: fill · Esc: cancel'}
           </span>
         )}
         <span className="spacer" />
@@ -444,6 +706,92 @@ export default function LabelerPane({
           />
         </label>
       </div>
+      {/* A dedicated row rather than more chips beside the title: the title bar
+          already overflowed at three sliders. Mounted only in wand mode. */}
+      {wandMode && (
+        <div className="wand-controls">
+          <WandSlider
+            label="tolerance"
+            value={wandSam ? wandSamTolerance : wandTolerance}
+            min={1}
+            max={100}
+            readout={wandSam
+              // The band that works under SAM features is narrow enough to be
+              // worth being able to name, so the cosine value is shown too.
+              ? (WAND_SAM_TOL_MIN + (wandSamTolerance / 100) * WAND_SAM_TOL_SPAN).toFixed(2)
+              : (wandTolerance / WAND_TOL_SCALE).toFixed(3)}
+            onChange={(v) => {
+              if (wandSam) setWandSamTolerance(v)
+              else setWandTolerances((t) => ({ ...t, [tool.classId]: v }))
+            }}
+          />
+          <WandSlider
+            label="max px"
+            value={wandBudgetStep}
+            min={1}
+            max={100}
+            readout={wandBudget(wandBudgetStep)?.toLocaleString() ?? 'none'}
+            onChange={setWandBudgetStep}
+          />
+          <WandSlider
+            label="sample"
+            value={wandSampleSize}
+            min={1}
+            max={25}
+            readout={`${wandSampleSize} px`}
+            onChange={setWandSampleSize}
+          />
+          <span className="spacer" />
+          <label
+            className="wand-toggle"
+            title={samAvailable
+              ? 'Group by SAM2 encoder features (texture and learned appearance) instead of by the image bands'
+              : 'SAM2 model files not found in sam2/'}
+          >
+            <input
+              type="checkbox"
+              checked={wandSam}
+              disabled={!samAvailable}
+              onChange={(e) => setWandSam(e.target.checked)}
+            />
+            SAM features
+          </label>
+          {wandSam && (
+            <div className="segmented compact">
+              {['fine', 'mid', 'deep'].map((level) => (
+                <button
+                  key={level}
+                  className={wandLevel === level ? 'active' : ''}
+                  title={{
+                    fine: '32ch at 256² — boundaries where the material changes',
+                    mid: '64ch at 128²',
+                    deep: '256ch at 64² — one cell covers 8×8 px',
+                  }[level]}
+                  onClick={() => setWandLevel(level)}
+                >
+                  {level}
+                </button>
+              ))}
+            </div>
+          )}
+          <label className="wand-toggle" title="Never paint over pixels that already carry a label">
+            <input
+              type="checkbox"
+              checked={wandProtect}
+              onChange={(e) => setWandProtect(e.target.checked)}
+            />
+            protect labels
+          </label>
+          <label className="wand-toggle" title="Drop the connectivity bound: select matching pixels anywhere in the image">
+            <input
+              type="checkbox"
+              checked={wandGlobal}
+              onChange={(e) => setWandGlobal(e.target.checked)}
+            />
+            whole image
+          </label>
+        </div>
+      )}
       <Viewport image={image} view={view} setView={setView}>
         <img src={`data:image/png;base64,${image?.png}`} alt="" draggable={false} />
         <canvas
@@ -458,9 +806,19 @@ export default function LabelerPane({
           onPointerLeave={hideCursor}
           onWheel={hideCursor}
           onDoubleClick={polygonMode ? closePolygon : undefined}
-          // In SAM2 mode right-click is the "exclude" gesture, so the webview's
-          // context menu must not open on it.
-          onContextMenu={samMode ? (e) => e.preventDefault() : undefined}
+          // In SAM2 and wand mode right-click is the "exclude" gesture, so the
+          // webview's context menu must not open on it.
+          onContextMenu={samMode || wandMode ? (e) => e.preventDefault() : undefined}
+        />
+        {/* The wand preview lives on its own canvas above the label canvas so
+            the pending selection never touches the label buffer, and so it can
+            be redrawn per slider step without repainting the labels. */}
+        <canvas
+          ref={wandCanvasRef}
+          className="wand-preview"
+          width={image?.width}
+          height={image?.height}
+          style={{ display: wandMode ? 'block' : 'none' }}
         />
         {polygonMode && verts.length > 0 && image && (
           <svg
@@ -530,7 +888,45 @@ export default function LabelerPane({
             })}
           </svg>
         )}
-        {!polygonMode && !samMode && oversized && (
+        {wandMode && wandSamples.length > 0 && image && (
+          // The same pink/red language the SAM2 markers use in this pane, so
+          // the two click-driven tools read the same way. The most recent
+          // marker is brighter and thicker, so it is clear what Backspace will
+          // take. The exclude marker keeps its bar: pink and red are close
+          // enough that colour alone is a weak distinction.
+          <svg className="poly-preview" viewBox={`0 0 ${image.width} ${image.height}`}>
+            {wandSamples.map((p, i) => {
+              const r = view ? 6 / view.scale : 6
+              const color = p.label ? SAM_INCLUDE_COLOR : SAM_EXCLUDE_COLOR
+              const latest = i === wandSamples.length - 1
+              return (
+                <g key={i}>
+                  <circle
+                    cx={p.x + 0.5}
+                    cy={p.y + 0.5}
+                    r={r}
+                    fill={`rgba(${color.join(',')}, ${latest ? 0.85 : 0.5})`}
+                    stroke={`rgb(${color.join(',')})`}
+                    strokeWidth={latest ? 3 : 1.5}
+                    vectorEffect="non-scaling-stroke"
+                  />
+                  {!p.label && (
+                    <line
+                      x1={p.x + 0.5 - r * 0.6}
+                      y1={p.y + 0.5}
+                      x2={p.x + 0.5 + r * 0.6}
+                      y2={p.y + 0.5}
+                      stroke={`rgb(${color.join(',')})`}
+                      strokeWidth={2}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  )}
+                </g>
+              )
+            })}
+          </svg>
+        )}
+        {!polygonMode && !samMode && !wandMode && oversized && (
           <div
             ref={cursorRef}
             className="brush-cursor"

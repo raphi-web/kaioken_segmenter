@@ -1,9 +1,38 @@
-import { useEffect } from 'react'
+import { useMemo, useState, useEffect } from 'react'
 
 // Model accuracy on the held-out validation images next to the training
 // images. A missing metric renders as an em dash, never as 0 — the two mean
 // very different things and the backend deliberately sends null.
 const fmt = (v) => (v === null || v === undefined ? '—' : v.toFixed(4))
+
+const COLUMNS = [
+  { key: 'name', label: 'image', type: 'string' },
+  { key: 'role', label: 'set', type: 'string' },
+  { key: 'status', label: 'status', type: 'string' },
+  { key: 'labeled_px', label: 'labeled px', type: 'number' },
+  { key: 'tp', label: 'TP', type: 'number' },
+  { key: 'fp', label: 'FP', type: 'number' },
+  { key: 'fn', label: 'FN', type: 'number' },
+  { key: 'iou', label: 'IoU', type: 'number' },
+  { key: 'f1', label: 'F1', type: 'number' },
+]
+
+// Rows sorted by one column at a time; missing metrics (null) always sink to
+// the bottom regardless of direction, rather than flip-flopping to the top.
+function sortRows(rows, sort) {
+  if (!sort.key) return rows
+  const { key, dir } = sort
+  const type = COLUMNS.find((c) => c.key === key)?.type
+  return [...rows].sort((a, b) => {
+    const av = a[key]
+    const bv = b[key]
+    if (av == null && bv == null) return 0
+    if (av == null) return 1
+    if (bv == null) return -1
+    if (type === 'string') return dir * av.localeCompare(bv)
+    return dir * (av - bv)
+  })
+}
 
 function SetSummary({ title, summary }) {
   if (!summary || !summary.images) {
@@ -45,8 +74,9 @@ function SetSummary({ title, summary }) {
   )
 }
 
-export default function AccuracyReport({ report, progress, error, onSave, onCancel, onClose }) {
+export default function AccuracyReport({ report, progress, error, onSave, onCancel, onClose, onOpenImage }) {
   const running = !report && !error
+  const [sort, setSort] = useState({ key: null, dir: 1 })
   useEffect(() => {
     function onKey(e) {
       if (e.key === 'Escape' && !running) onClose()
@@ -54,6 +84,12 @@ export default function AccuracyReport({ report, progress, error, onSave, onCanc
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose, running])
+
+  function toggleSort(key) {
+    setSort((s) => (s.key === key ? { key, dir: -s.dir } : { key, dir: 1 }))
+  }
+
+  const rows = useMemo(() => sortRows(report?.rows ?? [], sort), [report, sort])
 
   const gap = report
     && report.validation.micro.iou !== null
@@ -114,14 +150,24 @@ export default function AccuracyReport({ report, progress, error, onSave, onCanc
               <table className="report-table">
                 <thead>
                   <tr>
-                    <th>image</th><th>set</th><th>status</th><th>labeled px</th>
-                    <th>TP</th><th>FP</th><th>FN</th><th>IoU</th><th>F1</th>
+                    {COLUMNS.map((c) => (
+                      <th key={c.key} className="sortable" onClick={() => toggleSort(c.key)}>
+                        {c.label}
+                        {sort.key === c.key ? (sort.dir === 1 ? ' ▲' : ' ▼') : ''}
+                      </th>
+                    ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {report.rows.map((r) => (
+                  {rows.map((r) => (
                     <tr key={r.name} className={r.status === 'scored' ? '' : 'dim'}>
-                      <td className="mono">{r.name}</td>
+                      <td
+                        className="mono clickable"
+                        title={`Double-click to switch the view to ${r.name}`}
+                        onDoubleClick={() => onOpenImage(r.name)}
+                      >
+                        {r.name}
+                      </td>
                       <td className={r.role === 'validation' ? 'role-val' : ''}>{r.role}</td>
                       <td>{r.status}</td>
                       <td>{r.labeled_px.toLocaleString()}</td>

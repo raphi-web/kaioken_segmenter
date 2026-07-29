@@ -16,21 +16,45 @@ import rasterio
 import torch
 import webview
 
+try:
+    import cv2  # only for the wand's connected-component pass; see _connected_region
+except ImportError:  # pragma: no cover - opencv is a project dependency
+    cv2 = None
+
 import report as report_module
 import train as train_module
 from data import (UNLABELED, SentinelImage, array_to_png_b64, tile_geotiff,
                   write_mask_geotiff)
 from model import SegmentationModel
-from project import (SPLIT_ROLES, Project, config_from_settings, config_path,
-                     default_config, default_split, deterministic_validation,
+from project import (DEFAULT_CLASSES, SPLIT_ROLES, Project,
+                     config_from_settings, config_path, default_config,
+                     default_split, deterministic_validation,
                      probe_band_count, save_config)
-from sam_service import SamService, mask_to_polygons
+from sam_service import (FEATURE_LEVELS, SamService, mask_to_polygons,
+                         resize_bilinear)
 
-# RGBA colors for the prediction overlay (unlabeled/no-data stays transparent)
-CLASS_COLORS = {
-    0: (255, 80, 40, 160),    # target
-    1: (60, 140, 255, 160),   # background
-}
+# Alpha of the prediction overlay (unlabeled/no-data stays transparent); the
+# RGB part comes from the project's (or standalone image's) class palette.
+OVERLAY_ALPHA = 160
+
+
+# ---------- magic wand ----------
+
+# Offsets of a 5x5 window ordered nearest-first, so _sample_colour can take the
+# N pixels closest to a click by slicing the front of this list. The click
+# itself is offset 0, hence always included.
+_SAMPLE_OFFSETS = sorted(
+    ((dy, dx) for dy in range(-2, 3) for dx in range(-2, 3)),
+    key=lambda o: (o[0] * o[0] + o[1] * o[1], o[0], o[1]),
+)
+MAX_SAMPLE_PIXELS = len(_SAMPLE_OFFSETS)  # 25
+
+
+def _hex_to_rgba(hex_color, alpha=OVERLAY_ALPHA):
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    return (r, g, b, alpha)
+
 
 # Prebuilt standalone predictor (PyInstaller onedir). "Export Executable" copies
 # this folder and drops the current model.onnx beside the binary.
@@ -56,11 +80,22 @@ class Api:
         self._model = None  # built to match the data profile below
         self._class_map = None  # cached last full-image prediction
         self._probs = None      # matching (C, H, W) softmax probabilities
+        # Bumped whenever the model's weights (or the open project) change, so
+        # generate_accuracy_report can tell a cached report is still valid
+        # instead of rescoring every image again for nothing.
+        self._model_version = 0
         self._dirty_labels = {}  # name -> label buffer, edited this session and not yet saved
         self._dirty_geo = {}     # name -> (crs, transform) for each dirty entry above
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._sam = SamService()  # Efficient-SAM2 click assist, independent of _model
+        # Magic wand caches, both keyed by image name so a stale field can never
+        # outlive the image it describes (see _clear_wand_cache).
+        # _wand_cache:      (source, level, y, x, sample_size) -> full-image field
+        # _sam_stack_cache: level -> centred unit-length features, so each new
+        #                   sample is one dot product rather than a re-prepare.
+        self._wand_cache = (None, {})
+        self._sam_stack_cache = (None, {})
         # Background GeoTIFF tiling (see create_project_from_geotiff)
         self._tiling = {"running": False, "done": 0, "total": 0,
                         "result": None, "error": None}
@@ -68,7 +103,7 @@ class Api:
         # as _tiling; result holds the last finished report so save_accuracy_report
         # writes exactly what the modal is showing.
         self._report = {"running": False, "done": 0, "total": 0,
-                        "result": None, "error": None}
+                        "result": None, "error": None, "model_version": None}
         self._report_stop = threading.Event()
         self._status = {"state": "idle", "epoch": 0, "epochs": 0, "total_epochs": 0,
                        "images": 0, "ramp": None, "stage": None,
@@ -95,6 +130,17 @@ class Api:
         self._labels = labels
         self._class_map = None
         self._probs = None
+        self._clear_wand_cache()
+
+    def _clear_wand_cache(self):
+        """Drop every cached wand field. Called whenever the pixels change.
+
+        Both caches describe one specific image; keeping them across a switch
+        would let a click on the new image be answered from the old one's
+        distances, which is silently wrong rather than visibly broken.
+        """
+        self._wand_cache = (self._image_name, {})
+        self._sam_stack_cache = (self._image_name, {})
 
     def _display_bands(self):
         """The project's configured [R, G, B] display band indices, or None
@@ -118,6 +164,12 @@ class Api:
 
     # ---------- image / overlay ----------
 
+    def _overlay_colors(self):
+        """id -> RGBA for the prediction overlay: the open project's class
+        palette, or the standalone-image default when no project is open."""
+        classes = self._project.config["classes"] if self._project else DEFAULT_CLASSES
+        return {c["id"]: _hex_to_rgba(c["color"]) for c in classes}
+
     def get_image(self):
         return self._image_payload()
 
@@ -129,8 +181,8 @@ class Api:
             with self._lock:
                 self._class_map, self._probs = self._model.predict_image(self._image)
         rgba = np.zeros((*self._class_map.shape, 4), dtype=np.uint8)
-        for cls in (0, 1):
-            rgba[self._class_map == cls] = CLASS_COLORS[cls]
+        for cls, color in self._overlay_colors().items():
+            rgba[self._class_map == cls] = color
         return {"png": array_to_png_b64(rgba), "iou": self._target_iou()}
 
     def get_uncertainty(self):
@@ -241,6 +293,349 @@ class Api:
         if not polygons:
             return {"ok": False, "error": "SAM2 found no object at those points"}
         return {"ok": True, "polygons": polygons, "score": score}
+
+    # ---------- magic wand ----------
+    #
+    # Region-growing selection from clicks. The whole design serves one
+    # property: ADDING A POSITIVE CLICK NEVER REMOVES A PIXEL. Each sample is
+    # resolved completely independently -- its own reference, its own match set,
+    # its own region, its own budget -- and the results are unioned, so nothing
+    # about one sample can reach another. Negative clicks are the deliberate
+    # exception; removing pixels is what they are for.
+
+    def _sample_colour(self, y, x, sample_size):
+        """Mean spectrum of the `sample_size` valid pixels nearest (y, x).
+
+        Averaging denoises the reference: a one-pixel sample is a sample of size
+        one, and on textured ground the clicked pixel is easily an outlier its
+        own region then fails to match. Only valid pixels contribute, so a click
+        beside a nodata edge averages real ground rather than the fill value.
+        The clicked pixel is offset 0 of _SAMPLE_OFFSETS, so it always counts.
+
+        Note this averages *within* one click only. Averaging across clicks
+        would move the reference for everything, letting a new click drop pixels
+        an earlier one had selected -- exactly the property the wand promises.
+        """
+        image = self._image
+        stack = image.normalized
+        picked = []
+        for dy, dx in _SAMPLE_OFFSETS[:sample_size]:
+            py, px = y + dy, x + dx
+            if 0 <= py < image.height and 0 <= px < image.width and image.valid_mask[py, px]:
+                picked.append(stack[:, py, px])
+        if not picked:  # the click itself is nodata: fall back to its own value
+            picked = [stack[:, y, x]]
+        return np.mean(picked, axis=0)
+
+    def _spectral_field(self, y, x, sample_size):
+        """Per-pixel RMS band difference from the click's reference spectrum.
+
+        Computed over EVERY band of the normalized stack, not the three-band RGB
+        composite the pane displays: water and terrain shadow are near-identical
+        in true colour and separate cleanly in NIR/SWIR, and the composite has
+        discarded those bands before the frontend sees a pixel.
+
+        RMS rather than a plain Euclidean norm so one tolerance means the same
+        thing whether a project has 4 bands or 12.
+        """
+        ref = self._sample_colour(y, x, sample_size)[:, None, None]
+        diff = self._image.normalized - ref
+        return np.sqrt(np.mean(diff * diff, axis=0))
+
+    def _sam_features(self, level):
+        """Centred, unit-length SAM2 features for `level` as (C, h, w).
+
+        CENTRING IS LOAD-BEARING, not hygiene. Raw SAM2 features share a large
+        common component, so every pixel is far from every other: measured on a
+        512px tile, click-to-scene distances ran 0.4-0.8 with the whole useful
+        range inside the last tenth of that. Subtracting the image's own mean
+        feature puts the field at 0 at the click and spreads it to ~1.5, giving
+        the tolerance somewhere to work. The consequence, which the UI has to
+        live with, is that a tolerance is relative to the variety in the tile in
+        front of you rather than to SAM2's feature space at large.
+
+        Normalizing here makes the cosine distance downstream one dot product.
+        """
+        name, cache = self._sam_stack_cache
+        if name != self._image_name:  # defensive: _set_image should have cleared it
+            cache = {}
+            self._sam_stack_cache = (self._image_name, cache)
+        if level not in cache:
+            feats = np.asarray(self._sam.features(level), dtype=np.float32)
+            feats = feats - feats.mean(axis=(1, 2), keepdims=True)
+            norm = np.linalg.norm(feats, axis=0, keepdims=True)
+            cache[level] = feats / np.maximum(norm, 1e-8)
+        return cache[level]
+
+    def _embedding_field(self, y, x, sample_size, level):
+        """Per-pixel cosine distance from the click, in SAM2 feature space.
+
+        COSINE, not Euclidean: feature magnitude carries no meaning here and
+        varies wildly between the three levels; the angle does. (Same reasoning
+        as the spectral field's RMS.)
+
+        THE FIELD IS UPSAMPLED, NOT THE FEATURES. The distance is computed on
+        the encoder's own grid and only the finished one-channel field is
+        resized to image resolution -- upsampling `deep`'s 256 channels to a
+        512px image would cost 268 MB where its field costs 1 MB, and nothing
+        downstream can tell, since the flood fill, the valid mask and protection
+        all still run at pixel resolution.
+
+        A consequence worth knowing: after that upsample the exact zero at the
+        reference cell survives nowhere (0.09 at `fine` to 0.44 at `deep`, at
+        the clicked pixel itself). The wand does not depend on it -- the sample
+        is seeded into its own match set regardless.
+        """
+        feats = self._sam_features(level)
+        _, gh, gw = feats.shape
+        # The encoder resizes to a square regardless of aspect, so a pixel maps
+        # onto the grid by plain proportional scaling.
+        gy = min(gh - 1, max(0, int(y / self._image.height * gh)))
+        gx = min(gw - 1, max(0, int(x / self._image.width * gw)))
+        picked = []
+        for dy, dx in _SAMPLE_OFFSETS[:sample_size]:
+            cy, cx = gy + dy, gx + dx
+            if 0 <= cy < gh and 0 <= cx < gw:
+                picked.append(feats[:, cy, cx])
+        ref = np.mean(picked, axis=0)
+        ref = ref / max(float(np.linalg.norm(ref)), 1e-8)
+        field = 1.0 - np.tensordot(ref, feats, axes=(0, 0))  # (gh, gw)
+        return resize_bilinear(field, (self._image.height, self._image.width))
+
+    def _wand_fields(self, samples, sample_size, source, level):
+        """[((y, x), field), ...] -- one full-image distance field per sample.
+
+        `source` picks how distance is measured and nothing else in the wand
+        changes with it: connectivity, the budget, the negatives and protection
+        all consume only the field.
+
+        Cached per (source, level, point, sample_size), so adding a click costs
+        one new field, dragging the tolerance slider costs none, and flipping
+        between the two sources costs nothing after the first look at each.
+        """
+        name, cache = self._wand_cache
+        if name != self._image_name:
+            cache = {}
+            self._wand_cache = (self._image_name, cache)
+        out = []
+        for y, x in samples:
+            key = (source, level, y, x, sample_size)
+            if key not in cache:
+                cache[key] = (self._embedding_field(y, x, sample_size, level)
+                              if source == "sam"
+                              else self._spectral_field(y, x, sample_size))
+            out.append(((y, x), cache[key]))
+        return out
+
+    @staticmethod
+    def _connected_region(within, seed):
+        """The 4-connected component of `within` that contains `seed`.
+
+        4-CONNECTED, NOT 8: with 8 the fill crosses diagonals, so two regions
+        touching at a single corner pixel count as one and the selection leaks
+        through gaps too narrow to see at the zoom you clicked at.
+
+        Uses OpenCV's C implementation, which settles the common case on its
+        own; the pure-Python breadth-first fallback (unbounded _grow) is only
+        there so a missing cv2 degrades speed rather than the feature.
+        """
+        if cv2 is None:
+            return Api._grow_within_budget(within, seed, within.size)
+        count, labels = cv2.connectedComponents(
+            within.astype(np.uint8), connectivity=4)
+        return labels == labels[seed]
+
+    @staticmethod
+    def _grow_within_budget(within, seed, budget):
+        """The `budget` pixels of `within` nearest `seed` THROUGH the region.
+
+        Breadth-first from the seed, so pixels arrive in order of path distance
+        and the result is the innermost N and always connected. Taking the
+        nearest N by straight-line distance instead would return two halves of a
+        horseshoe with the middle missing.
+        """
+        height, width = within.shape
+        sy, sx = seed
+        out = np.zeros_like(within)
+        out[sy, sx] = True
+        queue = [(sy, sx)]
+        taken = 1
+        head = 0
+        while head < len(queue) and taken < budget:
+            cy, cx = queue[head]
+            head += 1
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < height and 0 <= nx < width and within[ny, nx] and not out[ny, nx]:
+                    out[ny, nx] = True
+                    taken += 1
+                    queue.append((ny, nx))
+                    if taken >= budget:
+                        break
+        return out
+
+    @staticmethod
+    def _nearest_within_budget(within, seed, budget):
+        """The `budget` pixels of `within` nearest `seed` by straight line.
+
+        Global mode's trimming: with connectivity dropped there is no path to
+        measure along, so straight-line distance is all that is left.
+        """
+        ys, xs = np.nonzero(within)
+        if ys.size <= budget:
+            return within
+        d2 = (ys - seed[0]) ** 2 + (xs - seed[1]) ** 2
+        keep = np.argpartition(d2, budget - 1)[:budget]
+        out = np.zeros_like(within)
+        out[ys[keep], xs[keep]] = True
+        return out
+
+    def _wand_region(self, field, seed, tolerance, negatives, is_global, budget):
+        """One sample's contribution: (trimmed region, untrimmed region, capped).
+
+        Both regions are returned from the one pass because the UI wants to say
+        how hard the budget is biting, and recomputing the untrimmed region to
+        answer that would double the cost of every click.
+        """
+        image = self._image
+        within = (field <= tolerance) & image.valid_mask
+        for neg in negatives:
+            # Nearest-neighbour rule: a pixel survives only while its own
+            # positive sample is a better match than every negative. One
+            # right-click therefore removes the offending material WHEREVER IT
+            # APPEARS, not only where clicked -- necessary because under global
+            # mode a bleed can be hundreds of scattered fragments.
+            within &= field < neg
+        within[seed] = True  # a click is never a silent no-op
+        region = within if is_global else self._connected_region(within, seed)
+        if budget is None or int(region.sum()) <= budget:
+            return region, region, False
+        trim = self._nearest_within_budget if is_global else self._grow_within_budget
+        return trim(region, seed, budget), region, True
+
+    def wand_select(self, samples, options):
+        """Select pixels of similar material around one or more clicks.
+
+        samples: [[x, y], ...] positive clicks in image pixels (at least one).
+        options: a single object rather than positional arguments, so a new knob
+        is one key instead of another argument whose position nobody remembers.
+
+          tolerance    float, REQUIRED. In the units of the chosen source.
+          source       "image" (default, spectral) or "sam" (encoder features).
+          level        "fine" (default) / "mid" / "deep". Ignored unless sam.
+          max_pixels   int or None (default None = unbounded). PER SAMPLE.
+          sample_size  int, default 1, clamped to 1..MAX_SAMPLE_PIXELS.
+          negatives    [[x, y], ...] or None. Exclusion clicks.
+          global       bool, default false. Drop the connectivity bound.
+          protect      bool, default false. Skip already-labeled pixels.
+                       The CALLER decides when this applies: it must not be set
+                       while the eraser is active, since the eraser only ever
+                       acts on labeled pixels and protecting them makes it a
+                       no-op.
+
+        Returns the selection as a bit-packed mask plus the counts the UI needs
+        to explain it. Every bad input comes back as {"ok": False, "error": ...}
+        rather than raising, because a traceback across the pywebview bridge is
+        not something the pane can show.
+        """
+        if self._image is None:
+            return {"ok": False, "error": "No image loaded"}
+        image = self._image
+        opts = options if isinstance(options, dict) else {}
+        try:
+            points = [(int(round(float(p[1]))), int(round(float(p[0]))))
+                      for p in (samples or [])]
+            negatives = [(int(round(float(p[1]))), int(round(float(p[0]))))
+                         for p in (opts.get("negatives") or [])]
+        except (TypeError, ValueError, IndexError):
+            return {"ok": False, "error": "Invalid sample coordinates"}
+        if not points:
+            return {"ok": False, "error": "No samples given"}
+        clamp = lambda p: (min(image.height - 1, max(0, p[0])),
+                           min(image.width - 1, max(0, p[1])))
+        points = [clamp(p) for p in points]
+        negatives = [clamp(p) for p in negatives]
+        try:
+            tolerance = float(opts["tolerance"])
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "error": "A numeric tolerance is required"}
+        try:
+            sample_size = int(opts.get("sample_size", 1))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "sample_size must be an integer"}
+        sample_size = min(MAX_SAMPLE_PIXELS, max(1, sample_size))
+        budget = opts.get("max_pixels")
+        if budget is not None:
+            try:
+                budget = int(budget)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "max_pixels must be an integer or null"}
+            if budget <= 0:
+                return {"ok": False, "error": "max_pixels must be positive"}
+        source = opts.get("source", "image")
+        if source not in ("image", "sam"):
+            return {"ok": False, "error": f"Unknown wand source: {source}"}
+        level = opts.get("level", "fine")
+        if level not in FEATURE_LEVELS:
+            return {"ok": False, "error": f"Unknown feature level: {level}"}
+        is_global = bool(opts.get("global"))
+        protect = bool(opts.get("protect"))
+
+        if source == "sam":
+            # Forced before the sample loop so a model error comes back as a
+            # message the pane can show rather than a traceback on the bridge.
+            reason = self._sam.unavailable_reason()
+            if reason is not None:
+                return {"ok": False, "error": reason}
+            try:
+                rgb = image.rgb_composite(self._display_bands())
+                self._sam.set_image(rgb, self._sam_image_key())
+            except Exception as e:
+                traceback.print_exc()
+                return {"ok": False, "error": f"SAM2 failed: {e}"}
+
+        with self._lock:
+            try:
+                fields = self._wand_fields(points, sample_size, source, level)
+                neg_fields = [f for _, f in
+                              self._wand_fields(negatives, sample_size, source, level)]
+            except Exception as e:
+                traceback.print_exc()
+                return {"ok": False, "error": f"Wand failed: {e}"}
+
+            selected = np.zeros((image.height, image.width), dtype=bool)
+            available = np.zeros_like(selected)
+            capped = False
+            for seed, field in fields:
+                # Each negative is compared at ITS OWN distance to this pixel,
+                # so the threshold a pixel must beat is the negative's field
+                # value there -- not a scalar. neg_fields are full fields.
+                region, uncapped, hit = self._wand_region(
+                    field, seed, tolerance, neg_fields, is_global, budget)
+                selected |= region
+                available |= uncapped
+                capped = capped or hit
+
+        # Protection is applied to the FINISHED selection, not the match set: a
+        # labeled pixel should still conduct the fill through itself, it simply
+        # does not get painted. Masking earlier would sever a region at the
+        # first labeled pixel it touches, so a fill could not reach unlabeled
+        # ground on the far side of a labeled strip.
+        protected = 0
+        if protect and self._labels is not None:
+            labeled = selected & (self._labels != UNLABELED)
+            protected = int(labeled.sum())
+            selected &= ~labeled
+        return {
+            "ok": True,
+            "mask": base64.b64encode(np.packbits(selected).tobytes()).decode("ascii"),
+            "count": int(selected.sum()),
+            "available": int(available.sum()),
+            "protected": protected,
+            "capped": capped,
+            "valid": int(image.valid_mask.sum()),
+            "width": image.width,
+            "height": image.height,
+        }
 
     # ---------- training ----------
 
@@ -381,6 +776,7 @@ class Api:
                     stop_event=self._stop_event,
                 )
                 self._status["total_epochs"] += done
+                self._model_version += 1
                 self._save_model_checkpoint()
                 self._class_map, self._probs = self._model.predict_image(self._image)
             self._status.update({"state": "idle", "stage": None})
@@ -429,9 +825,10 @@ class Api:
 
         Unreadable or profile-mismatched checkpoints are ignored (the model
         stays freshly initialized), like the corrupt-mask fallback in
-        _read_user_mask. Loading is filtered like the pretrained-weights load:
-        toggling PointRend adds/removes the point head, and the shared U-Net
-        weights must survive the toggle in either direction.
+        _read_user_mask. Loading is filtered by name and shape: toggling
+        PointRend adds/removes the point head, and the shared encoder/decoder
+        weights must survive the toggle in either direction. The same filter
+        discards checkpoints written by an older architecture.
         """
         path = project.model_checkpoint_path
         if not os.path.exists(path):
@@ -461,6 +858,7 @@ class Api:
             self._model = SegmentationModel(in_channels=self._model.in_channels,
                                             patch_size=self._model.patch_size,
                                             use_pointrend=self._model.use_pointrend)
+            self._model_version += 1
             self._class_map = None
             self._probs = None
             if self._project is not None:
@@ -697,6 +1095,7 @@ class Api:
             self._autosave_user_mask()  # labels of the previously open project
             self._set_image(None, None)
             self._model = model
+            self._model_version += 1
             self._dirty_labels = {}
             self._dirty_geo = {}
         self._status.update({"state": "idle", "epoch": 0, "epochs": 0,
@@ -749,7 +1148,23 @@ class Api:
         merged["input_patch_size"] = profile["input_patch_size"][0]
         try:
             config = config_from_settings(merged)
-            config["classes"] = [dict(c) for c in old["classes"]]  # keep the palette
+            # config_from_settings resets the palette to the defaults; keep the
+            # project's ids/names and only accept edited colors from the dialog
+            # (validated below by save_config -> validate_config).
+            new_classes = settings.get("classes")
+            by_id = {c["id"]: c for c in old["classes"]}
+            merged_classes = None
+            if isinstance(new_classes, list) and len(new_classes) == len(old["classes"]):
+                merged_classes = []
+                for nc in new_classes:
+                    if not isinstance(nc, dict) or nc.get("id") not in by_id:
+                        merged_classes = None
+                        break
+                    cls = dict(by_id[nc["id"]])
+                    if isinstance(nc.get("color"), str):
+                        cls["color"] = nc["color"]
+                    merged_classes.append(cls)
+            config["classes"] = merged_classes or [dict(c) for c in old["classes"]]
             # config_from_settings rebuilds the whole dict, so anything not
             # carried over here is silently dropped. The split is creation-time
             # (ratio) plus the user's per-image moves (overrides): neither is
@@ -776,6 +1191,7 @@ class Api:
                 self._status["total_epochs"] = self._load_model_checkpoint(
                     model, self._project)
                 self._model = model
+                self._model_version += 1
                 self._class_map = None
                 self._probs = None
         if config["data_profile"]["display_bands"] != profile.get("display_bands"):
@@ -784,6 +1200,10 @@ class Api:
             # thumbnail, overwriting the old ones.
             if self._image is not None:
                 result["image"] = self._image_payload()
+            # The SAM2 encoder reads exactly those three bands, so every cached
+            # embedding field now describes an image that no longer exists. The
+            # spectral fields are dropped with them: one cache, one lifetime.
+            self._clear_wand_cache()
             self._project.start_thumbnail_generation(force=True)
         return result
 
@@ -837,6 +1257,78 @@ class Api:
         except (OSError, ValueError) as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "project": self.get_project()}
+
+    def delete_image(self, name):
+        """Permanently remove an image and its user/AI masks and thumbnail.
+
+        If the deleted image is the active one, its in-memory buffer is
+        dropped without autosaving (there is nothing left on disk to save it
+        against) and the next remaining image is loaded in its place, or the
+        panes clear if none are left.
+        """
+        if self._project is None:
+            return {"ok": False, "error": "No project open"}
+        if self._status["state"] == "training":
+            return {"ok": False, "error": "Wait for training to finish"}
+        if self._report["running"]:
+            return {"ok": False, "error": "Wait for the accuracy report to finish"}
+        if name not in self._project.list_images():
+            return {"ok": False, "error": f"Unknown image: {name}"}
+
+        was_active = name == self._image_name
+        user_path, ai_path = self._project.mask_paths(name)
+        for path in (self._project.image_path(name), user_path, ai_path,
+                     self._project.thumb_path(name)):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                return {"ok": False, "error": f"Could not delete {name}: {e}"}
+
+        self._dirty_labels.pop(name, None)
+        self._dirty_geo.pop(name, None)
+
+        # A cached accuracy report may still list the deleted image: drop its
+        # row and re-pool the set summaries from what remains, rather than
+        # invalidating the whole cache (deleting an image doesn't retrain, so
+        # every other row's score is still exactly right).
+        cached = self._report["result"]
+        if cached is not None:
+            rows = [r for r in cached["rows"] if r["name"] != name]
+            if len(rows) != len(cached["rows"]):
+                self._report["result"] = report_module.build_report(
+                    rows, total_epochs=cached["total_epochs"],
+                    project_name=cached["project_name"],
+                    generated_at=cached["generated_at"])
+
+        # Drop a manual split override for the deleted name so the config
+        # doesn't keep pointing at an image that no longer exists.
+        config = self._project.config
+        split = dict(config.get("split") or default_split())
+        overrides = dict(split.get("overrides") or {})
+        if overrides.pop(name, None) is not None:
+            split["overrides"] = overrides
+            config["split"] = split
+            try:
+                save_config(self._project.root, config)
+            except (OSError, ValueError) as e:
+                return {"ok": False, "error": str(e)}
+
+        result = {"ok": True}
+        if was_active:
+            with self._lock:
+                self._set_image(None, None)  # the buffer's file is already gone
+            remaining = self._project.list_images()
+            if remaining:
+                loaded = self.load_image(remaining[0])
+                result["image"] = loaded.get("image")
+                if loaded.get("error"):
+                    result["image_error"] = loaded["error"]
+            else:
+                result["image"] = None
+        result["project"] = self.get_project()
+        return result
 
     def load_image(self, name):
         """Make an image of the project active in both panes.
@@ -1015,7 +1507,14 @@ class Api:
         return {"ok": True, "path": path}
 
     def _write_model_onnx(self, path):
-        """Export the U-Net to `path` as ONNX (+ metadata). Shared by exports."""
+        """Export the network to `path` as ONNX (+ metadata). Shared by exports.
+
+        Only the batch axis is dynamic. The bottleneck's positional embedding is
+        sized for exactly one patch size, and both consumers (predict_image and
+        the standalone predictor) only ever feed patch_size tiles, so declaring
+        the spatial axes dynamic would only advertise sizes the graph cannot
+        actually serve.
+        """
         with self._lock:
             net = self._model.net
             net.eval()
@@ -1025,8 +1524,7 @@ class Api:
                 net, dummy, path,
                 input_names=["input"], output_names=["logits"],
                 opset_version=17, dynamo=False,
-                dynamic_axes={"input": {0: "batch", 2: "height", 3: "width"},
-                              "logits": {0: "batch", 2: "height", 3: "width"}},
+                dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
             )
         self._annotate_onnx(path)
 
@@ -1044,7 +1542,7 @@ class Api:
                 "patch_size": str(self._model.patch_size),
                 "use_pointrend": str(self._model.use_pointrend),
                 "band_names": json.dumps(profile.get("band_names", [])),
-                "output": "logits; sigmoid(logit)=P(target); classes 0=target 1=background",
+                "output": "logits; softmax over 2 channels; classes 0=target 1=background",
                 "input_normalization": "per-band 2-98 percentile robust scaling to [0,1]",
             })
             onnx.save(model, path)
@@ -1095,6 +1593,11 @@ class Api:
         Runs over every labeled image, so it takes minutes on a large project and
         follows the tiling pattern: validate synchronously, hand an immutable
         snapshot to a worker, report through accuracy_report_progress().
+
+        The last finished report is reused as-is when nothing has retrained or
+        replaced the model since (see _model_version) -- rescoring every image
+        again would produce byte-identical numbers, so accuracy_report_progress
+        is left pointing at the existing result instead of a new run.
         """
         if self._status["state"] == "training":
             return {"ok": False, "error": "Wait for training to finish"}
@@ -1102,6 +1605,9 @@ class Api:
             return {"ok": False, "error": "A report is already running"}
         if self._image is None:
             return {"ok": False, "error": "No image loaded"}
+        if (self._report["result"] is not None
+                and self._report.get("model_version") == self._model_version):
+            return {"ok": True, "started": False, "cached": True}
         # Snapshot on *this* thread, before the worker starts. _dirty_labels
         # stores a reference to the live label array and transfer_prediction
         # mutates it in place, so a worker holding the bare reference would
@@ -1119,7 +1625,8 @@ class Api:
             return {"ok": False,
                     "error": "Label at least one image before generating a report"}
         self._report = {"running": True, "done": 0, "total": len(samples),
-                        "result": None, "error": None}
+                        "result": None, "error": None,
+                        "model_version": self._model_version}
         self._report_stop.clear()
         threading.Thread(target=self._report_worker, args=(samples,),
                          daemon=True).start()

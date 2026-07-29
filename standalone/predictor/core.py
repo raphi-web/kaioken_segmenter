@@ -1,4 +1,4 @@
-"""Standalone U-Net ONNX predictor: GeoTIFF in -> prediction GeoTIFF out.
+"""Standalone segmentation ONNX predictor: GeoTIFF in -> prediction GeoTIFF out.
 
 Self-contained (onnxruntime + rasterio + numpy only): no torch, no imports from
 the app's `backend/`. The inference mirrors the in-app path exactly
@@ -138,7 +138,7 @@ def predict_geotiff(onnx_path, in_path, out_path, band_map=None, nodata=None,
 
     norm, valid = _normalize(raw, nd)
     corners = _patch_grid(height, width, size)
-    acc = np.zeros((1, height, width), np.float32)
+    acc = None  # (classes, H, W); sized from the first batch's output
     weight = np.zeros((height, width), np.float32)
 
     total = len(corners)
@@ -146,7 +146,9 @@ def predict_geotiff(onnx_path, in_path, out_path, band_map=None, nodata=None,
     for i in range(0, total, _BATCH):
         chunk = corners[i:i + _BATCH]
         batch = np.stack([norm[:, y:y + size, x:x + size] for y, x in chunk])
-        logits = session.run(None, {"input": batch})[0]  # (b, 1, s, s)
+        logits = session.run(None, {"input": batch})[0]  # (b, classes, s, s)
+        if acc is None:
+            acc = np.zeros((logits.shape[1], height, width), np.float32)
         for (y, x), logit in zip(chunk, logits):
             acc[:, y:y + size, x:x + size] += logit
             weight[y:y + size, x:x + size] += 1.0
@@ -156,10 +158,12 @@ def predict_geotiff(onnx_path, in_path, out_path, band_map=None, nodata=None,
 
     weight = np.maximum(weight, 1e-6)
     logit_map = acc / weight
-    # Stable sigmoid; clip avoids overflow warnings at extreme logits (±60 is
-    # already 0/1 to float precision, matching torch.sigmoid).
-    p_target = 1.0 / (1.0 + np.exp(-np.clip(logit_map[0], -60.0, 60.0)))
-    class_map = (p_target <= 0.5).astype(np.uint8)  # 0 target, 1 background
+    # Stable softmax over the class axis: subtracting the per-pixel max leaves
+    # the result unchanged but keeps exp() away from overflow.
+    shifted = np.exp(logit_map - logit_map.max(axis=0, keepdims=True))
+    probs = shifted / shifted.sum(axis=0, keepdims=True)
+    p_target = probs[0]  # the class index is the label value: 0 = target
+    class_map = probs.argmax(axis=0).astype(np.uint8)  # 0 target, 1 background
     class_map[~valid] = UNLABELED
 
     _write_geotiff(out_path, class_map, crs, transform, "uint8", UNLABELED)

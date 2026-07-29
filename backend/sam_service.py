@@ -46,6 +46,16 @@ _MODELS = {"tiny": "sam2.1_hiera_tiny", "small": "sam2.1_hiera_small"}
 _MEAN = [0.485, 0.456, 0.406]
 _STD = [0.229, 0.224, 0.225]
 
+# The encoder's three outputs, exposed as selectable levels for the magic wand's
+# embedding source. Index into the (image_embed, hrf0, hrf1) tuple cached by
+# set_image; the shapes are the encoder's own, over its fixed 1024x1024 input
+# frame, so one cell covers more ground the deeper the level:
+#
+#   fine   high_res_feat0    32 ch at 256x256
+#   mid    high_res_feat1    64 ch at 128x128
+#   deep   image_embed      256 ch at  64x64
+FEATURE_LEVELS = {"fine": 1, "mid": 2, "deep": 0}
+
 
 class SamService:
     """Lazy onnxruntime wrapper around the exported SAM2 encoder/decoder."""
@@ -132,6 +142,21 @@ class SamService:
             self._orig_hw = (int(rgb.shape[0]), int(rgb.shape[1]))
             self._image_key = key
 
+    def features(self, level):
+        """The cached encoder feature map for `level` as (C, h, w) float32.
+
+        set_image() must have been called first. The grid is the encoder's, not
+        the image's -- the caller works on it and upsamples afterwards (see
+        resize_bilinear). Shares the one encoder pass with predict_points, so
+        whichever of the wand and the snap tool runs first pays for both.
+        """
+        if level not in FEATURE_LEVELS:
+            raise ValueError(f"unknown feature level: {level}")
+        with self._lock:
+            if self._feats is None or self._image_key is None:
+                raise RuntimeError("SAM2 image embeddings are not set")
+            return self._feats[FEATURE_LEVELS[level]][0]
+
     def predict_points(self, points):
         """Object mask (bool H×W) for a list of clicks.
 
@@ -198,6 +223,21 @@ class SamService:
                 torch.from_numpy(prev), (height, width),
                 mode="bilinear", align_corners=False)
             return up[0, 0].numpy() > 0.0, score
+
+
+def resize_bilinear(field, shape_hw):
+    """Resample a 2D float field to (H, W) bilinearly.
+
+    Used to lift a distance field off the encoder's grid onto image pixels.
+    Matches how SAM2 upscales its own low-res mask logits (align_corners=False),
+    so the wand's boundaries land where the snap tool's would.
+    """
+    import torch
+
+    out = torch.nn.functional.interpolate(
+        torch.from_numpy(np.ascontiguousarray(field, dtype=np.float32))[None, None],
+        tuple(shape_hw), mode="bilinear", align_corners=False)
+    return out[0, 0].numpy()
 
 
 def mask_to_polygons(mask, min_area=16, epsilon_frac=0.004):
