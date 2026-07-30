@@ -22,19 +22,29 @@ a standalone executable, or the merged mask.
 
 ## Install & run
 
-Grab the wheel from the [releases page](https://github.com/raphi-web/kaioken_segmenter/releases):
+Install straight from the release — no download step:
 
 ```bash
 python3 -m venv .venv
 # CPU-only torch (no CUDA download); drop the extra index on a GPU machine
 .venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu \
-    kaioken_segmenter-0.1.0-py3-none-any.whl
+    https://github.com/raphi-web/kaioken_segmenter/releases/download/v0.1.0/kaioken_segmenter-0.1.0-py3-none-any.whl
 .venv/bin/python -m kaioken start [path/to/image.tiff | path/to/project_dir]
 ```
 
+Newer versions are on the
+[releases page](https://github.com/raphi-web/kaioken_segmenter/releases); swap
+the version in the URL, or download the `.whl` and pass its path instead.
+
 `pywebview` renders through GTK/WebKit2 when the system has it
 (`PyGObject` + `gir1.2-webkit2-4.1`). If it does not, install the bundled Qt
-renderer instead: `pip install "kaioken-segmenter[qt]"`.
+renderer instead — note the quotes, which shells need around the brackets:
+
+```bash
+.venv/bin/pip install "kaioken-segmenter[qt] @ https://github.com/raphi-web/kaioken_segmenter/releases/download/v0.1.0/kaioken_segmenter-0.1.0-py3-none-any.whl"
+```
+
+The same form adds `[export]` for "Export Executable", or `[qt,export]` for both.
 
 ### Commands
 
@@ -115,10 +125,10 @@ python3 -m build
 
 That is the whole thing. It writes two files to `dist/`:
 
-| File                                       | Size    | What it is             |
-| ------------------------------------------ | ------- | ---------------------- |
-| `kaioken_segmenter-0.1.0-py3-none-any.whl` | ~170 KB | the installable wheel  |
-| `kaioken_segmenter-0.1.0.tar.gz`           | ~140 KB | source distribution    |
+| File                                       | Size    | What it is            |
+| ------------------------------------------ | ------- | --------------------- |
+| `kaioken_segmenter-0.1.0-py3-none-any.whl` | ~170 KB | the installable wheel |
+| `kaioken_segmenter-0.1.0.tar.gz`           | ~140 KB | source distribution   |
 
 The wheel is `py3-none-any` — pure Python, so one build works on every platform
 and Python 3.10+.
