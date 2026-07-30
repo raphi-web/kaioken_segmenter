@@ -19,7 +19,7 @@ from rasterio.enums import Resampling
 # model.py owns the list of architectures; this module only validates that the
 # config names one of them. (model.py does not import this one, so there is no
 # cycle, and api.py -- project.py's only consumer -- already imports both.)
-from model import BOTTLENECKS, DEFAULT_BOTTLENECK
+from .model import BOTTLENECKS, DEFAULT_BOTTLENECK
 
 CONFIG_NAME = "project_config.json"
 THUMB_DIR = ".thumbnails"

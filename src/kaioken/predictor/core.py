@@ -1,7 +1,7 @@
 """Standalone segmentation ONNX predictor: GeoTIFF in -> prediction GeoTIFF out.
 
 Self-contained (onnxruntime + rasterio + numpy only): no torch, no imports from
-the app's `backend/`. The inference mirrors the in-app path exactly
+the app's own modules. The inference mirrors the in-app path exactly
 (SegmentationModel.predict_image + SentinelImage normalization + tiling +
 blend_tiles), so a prediction here matches what the app produces.
 
@@ -23,11 +23,16 @@ _BATCH = 16
 
 
 def default_model_path():
-    """`model.onnx` next to the executable (frozen) or this package (source)."""
+    """`model.onnx` next to the executable, or in the working directory.
+
+    The exported bundle ships the model beside the binary, which is what makes it
+    double-clickable. Run as a library instead (`kaioken predict`) there is no such
+    sibling, so the cwd is the useful default -- and `--model` overrides either.
+    """
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        base = os.getcwd()
     return os.path.join(base, "model.onnx")
 
 

@@ -16,7 +16,7 @@ project's U-Net, so it never touches the training loop.
 
 The ONNX files live in `sam2/onnx/`; regenerate them with::
 
-    venv/bin/python backend/export_sam_onnx.py --size tiny
+    python tools/export_sam_onnx.py --size tiny   (from a source checkout)
 """
 
 import os
@@ -29,9 +29,12 @@ try:
 except ImportError:  # pragma: no cover - opencv is a project dependency
     cv2 = None
 
-# sam2/onnx sits next to backend/ (see export_sam_onnx.py).
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_ONNX_DIR = os.path.join(_PROJECT_ROOT, "sam2", "onnx")
+from . import assets
+
+# Downloaded on demand (python -m kaioken fetch-assets --sam2); resolved from the
+# cache or the source tree by assets.py. Absent is fine -- available() reports it
+# and the frontend leaves the SAM2 button disabled.
+_ONNX_DIR = str(assets.sam2_onnx_dir())
 
 # Model size -> filename stem of its exported encoder/decoder graphs.
 _MODELS = {"tiny": "sam2.1_hiera_tiny", "small": "sam2.1_hiera_small"}
@@ -82,7 +85,7 @@ class SamService:
             if not os.path.exists(path):
                 return ("SAM2 ONNX model missing "
                         f"({os.path.basename(path)}); run "
-                        "backend/export_sam_onnx.py")
+                        "python -m kaioken fetch-assets --sam2")
         return None
 
     def available(self):

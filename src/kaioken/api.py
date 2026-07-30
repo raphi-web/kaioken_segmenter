@@ -6,6 +6,8 @@ JSON-serializable data, so each JS call resolves as a promise.
 
 import base64
 import os
+import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -15,19 +17,19 @@ import rasterio
 import torch
 import webview
 
-import report as report_module
-import train as train_module
-from data import (EXCLUDED, UNLABELED, SentinelImage, array_to_png_b64,
+from . import report as report_module
+from . import train as train_module
+from .data import (EXCLUDED, UNLABELED, SentinelImage, array_to_png_b64,
                   tile_geotiff, write_mask_geotiff)
-from model import DEFAULT_BOTTLENECK, SegmentationModel
-from project import (DEFAULT_CLASSES, SPLIT_ROLES, Project,
+from .model import DEFAULT_BOTTLENECK, SegmentationModel
+from .project import (DEFAULT_CLASSES, SPLIT_ROLES, Project,
                      config_from_settings, config_path, default_config,
                      default_split, deterministic_validation,
                      probe_band_count, save_config)
-from sam_service import FEATURE_LEVELS, SamService, mask_to_polygons
-from wand import MAX_SAMPLE_PIXELS
-from wand import SOURCES as WAND_SOURCES
-from wand import WandSelector
+from .sam_service import FEATURE_LEVELS, SamService, mask_to_polygons
+from .wand import MAX_SAMPLE_PIXELS
+from .wand import SOURCES as WAND_SOURCES
+from .wand import WandSelector
 
 # Alpha of the prediction overlay (unlabeled/no-data stays transparent); the
 # RGB part comes from the project's (or standalone image's) class palette.
@@ -40,12 +42,11 @@ def _hex_to_rgba(hex_color, alpha=OVERLAY_ALPHA):
     return (r, g, b, alpha)
 
 
-# Prebuilt standalone predictor (PyInstaller onedir, from standalone/build.sh).
-# "Export Executable" copies this folder and drops the current model.onnx
-# beside the binary.
-_PREDICTOR_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "standalone", "dist", "predictor")
+# PyInstaller spec for the standalone predictor, packaged alongside this module.
+# "Export Executable" builds it on demand rather than shipping a prebuilt bundle:
+# the onedir is ~300 MB, which has no business inside a wheel.
+_PREDICTOR_SPEC = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "_pyinstaller", "predictor.spec")
 
 
 class Api:
@@ -79,6 +80,10 @@ class Api:
         self._report = {"running": False, "done": 0, "total": 0,
                         "result": None, "error": None, "model_version": None}
         self._report_stop = threading.Event()
+        # Background predictor build (see export_executable). PyInstaller gives
+        # no usable progress signal, so this tracks a stage label rather than
+        # a count -- there is nothing honest to put in done/total.
+        self._export = {"running": False, "stage": None, "path": None, "error": None}
         self._status = {"state": "idle", "epoch": 0, "epochs": 0, "total_epochs": 0,
                        "images": 0, "ramp": None, "stage": None,
                        "scan_done": 0, "scan_total": 0,
@@ -1383,40 +1388,109 @@ class Api:
             traceback.print_exc()  # metadata is optional; the .onnx is already written
 
     def executable_available(self):
-        """Whether the prebuilt standalone predictor is present to export."""
-        exe = os.path.join(_PREDICTOR_DIR, "predictor")
-        ok = os.path.isdir(_PREDICTOR_DIR) and (
-            os.path.exists(exe) or os.path.exists(exe + ".exe"))
-        return {"available": ok,
-                "reason": None if ok else "Predictor not built (run standalone/predictor.spec)"}
+        """Whether the standalone predictor can be built here."""
+        import importlib.util
+
+        ok = (importlib.util.find_spec("PyInstaller") is not None
+              and os.path.isfile(_PREDICTOR_SPEC))
+        if ok:
+            return {"available": True, "reason": None}
+        reason = ('PyInstaller is not installed; run: pip install '
+                  '"kaioken-segmenter[export]"')
+        if not os.path.isfile(_PREDICTOR_SPEC):
+            reason = f"Predictor build spec missing ({_PREDICTOR_SPEC})"
+        return {"available": False, "reason": reason}
 
     def export_executable(self):
-        """Export a clickable standalone predictor.
+        """Build a clickable standalone predictor, in the background.
 
-        Writes a self-contained folder: the prebuilt predictor executable plus
+        Writes a self-contained folder: a PyInstaller bundle of the predictor plus
         this project's model as `model.onnx` beside it (the exe loads the sibling
         model at runtime). The user runs the executable, picks a GeoTIFF, maps
         its bands to the model channels, and gets a prediction GeoTIFF — all
         without Python installed.
+
+        The bundle is built on demand and takes minutes, so this returns as soon
+        as the worker starts; poll export_executable_progress() for the outcome.
+        The folder dialog and the ONNX snapshot both happen here, on the calling
+        thread, so the user picks a destination before the wait begins and the
+        exported model is the one that was current when they clicked.
         """
         if self._status["state"] == "training":
             return {"ok": False, "error": "Wait for training to finish"}
-        if not self.executable_available()["available"]:
-            return {"ok": False,
-                    "error": "Predictor executable not built; run standalone/predictor.spec"}
+        if self._export["running"]:
+            return {"ok": False, "error": "An export is already running"}
+        availability = self.executable_available()
+        if not availability["available"]:
+            return {"ok": False, "error": availability["reason"]}
         folder = self._folder_dialog()
         if not folder:
             return {"ok": False, "error": None}  # user cancelled
-        import shutil
 
         dest = os.path.join(folder, "UNet-Predictor")
+        # Snapshot the model now, to a temp file, rather than after the build:
+        # the user is free to keep training while PyInstaller runs, and the
+        # export must reflect the model they clicked on.
         try:
-            shutil.copytree(_PREDICTOR_DIR, dest, dirs_exist_ok=True)
-            self._write_model_onnx(os.path.join(dest, "model.onnx"))
+            os.makedirs(dest, exist_ok=True)
+            onnx_tmp = os.path.join(tempfile.mkdtemp(prefix="kaioken-export-"),
+                                    "model.onnx")
+            self._write_model_onnx(onnx_tmp)
         except (OSError, RuntimeError) as e:
             traceback.print_exc()
             return {"ok": False, "error": f"Export failed: {e}"}
-        return {"ok": True, "path": dest}
+
+        self._export = {"running": True, "stage": "Building the predictor "
+                        "(a few minutes)…", "path": None, "error": None}
+        threading.Thread(target=self._export_worker, args=(dest, onnx_tmp),
+                         daemon=True).start()
+        return {"ok": True, "started": True, "path": dest}
+
+    def export_executable_progress(self):
+        """Poll the background export: stage while running, path/error when done."""
+        e = self._export
+        return {"running": e["running"], "stage": e["stage"],
+                "path": e["path"], "error": e["error"]}
+
+    def _export_worker(self, dest, onnx_tmp):
+        """Run PyInstaller into a temp dir, then move the bundle to `dest`."""
+        import shutil
+        import subprocess
+
+        build_root = tempfile.mkdtemp(prefix="kaioken-pyinstaller-")
+        try:
+            distpath = os.path.join(build_root, "dist")
+            proc = subprocess.run(
+                [sys.executable, "-m", "PyInstaller", _PREDICTOR_SPEC,
+                 "--noconfirm", "--distpath", distpath,
+                 "--workpath", os.path.join(build_root, "build")],
+                capture_output=True, text=True)
+            if proc.returncode != 0:
+                # PyInstaller's failures are long and mostly boilerplate; the
+                # last few lines carry the actual cause, and the full output
+                # goes to the console for anyone debugging a build.
+                print(proc.stdout, proc.stderr, sep="\n")
+                tail = "\n".join(proc.stderr.strip().splitlines()[-5:])
+                self._export["error"] = f"PyInstaller failed:\n{tail}"
+                return
+
+            built = os.path.join(distpath, "predictor")
+            if not os.path.isdir(built):
+                self._export["error"] = f"Build produced no bundle at {built}"
+                return
+
+            self._export["stage"] = "Copying the bundle…"
+            shutil.copytree(built, dest, dirs_exist_ok=True)
+            shutil.move(onnx_tmp, os.path.join(dest, "model.onnx"))
+            self._export["path"] = dest
+        except (OSError, RuntimeError) as e:
+            traceback.print_exc()
+            self._export["error"] = f"Export failed: {e}"
+        finally:
+            shutil.rmtree(build_root, ignore_errors=True)
+            shutil.rmtree(os.path.dirname(onnx_tmp), ignore_errors=True)
+            self._export["running"] = False
+            self._export["stage"] = None
 
     # ---------- accuracy report ----------
 

@@ -1,6 +1,6 @@
 """Invariant tests for the magic wand (Api.wand_select).
 
-    python3 backend/test_wand.py
+    python3 -m pytest tests/test_wand.py
 
 Runs against a scratch COPY of the project in /tmp, never against the real
 label_raster/. An earlier version of these tests wrote to the actual ground
@@ -25,17 +25,14 @@ independent of it on purpose.)
 import base64
 import os
 import shutil
-import sys
 import tempfile
 import unittest
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from api import Api  # noqa: E402
-from data import UNLABELED  # noqa: E402
-from sam_service import SamService  # noqa: E402
+from kaioken.api import Api
+from kaioken.data import UNLABELED
+from kaioken.sam_service import SamService
 
 SOURCE_PROJECT = os.environ.get(
     "WAND_TEST_PROJECT", "/home/raphi/SSD-KHADAS/kaioken_labeler")

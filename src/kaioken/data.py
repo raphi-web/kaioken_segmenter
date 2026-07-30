@@ -33,7 +33,7 @@ UNLABELED = 255  # "no user annotation" -- never a class; CE's ignore_index
 EXCLUDED = 254
 
 # The same vocabulary is redeclared in two places on purpose, so leave them be:
-# standalone/predictor/core.py must not import from backend/ (it ships without
+# kaioken/predictor/core.py must not import from the app modules (it ships without
 # torch), and frontend/src/constants.js is another language.
 
 # Band order of the original 10-band Sentinel-2 stacks (kept for reference).

@@ -20,22 +20,84 @@ Workflow: paint ground-truth strokes on the right pane, click
 Iterate until the prediction is good, then export the model (`.pth`/`.onnx`),
 a standalone executable, or the merged mask.
 
-## Setup & run
+## Install & run
+
+Grab the wheel from the [releases page](https://github.com/raphi-web/kaioken_segmenter/releases):
 
 ```bash
 python3 -m venv .venv
 # CPU-only torch (no CUDA download); drop the extra index on a GPU machine
-.venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt
-.venv/bin/pip install "pywebview[qt]"   # bundled Qt renderer, no system GTK needed
-cd frontend && npm install && npm run build && cd ..
-.venv/bin/python backend/main.py [path/to/image.tiff | path/to/project_dir]   # defaults to 00.tiff
+.venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+    kaioken_segmenter-0.1.0-py3-none-any.whl
+.venv/bin/python -m kaioken start [path/to/image.tiff | path/to/project_dir]
 ```
 
-The SAM2 click-assist tool needs `sam2/onnx/*.onnx` (regenerate with
-`backend/export_sam_onnx.py`, see its docstring); without them the SAM2
-button stays disabled. The standalone predictor and "Export Executable" need
-`pyinstaller` and a build of `standalone/predictor.spec` — see
-`standalone/README.md`.
+`pywebview` renders through GTK/WebKit2 when the system has it
+(`PyGObject` + `gir1.2-webkit2-4.1`). If it does not, install the bundled Qt
+renderer instead: `pip install "kaioken-segmenter[qt]"`.
+
+### Commands
+
+```bash
+python3 -m kaioken start [PATH]     # open the labelling app
+python3 -m kaioken fetch-assets     # download the optional model assets
+python3 -m kaioken predict IMG.tif  # run an exported model.onnx, no GUI
+python3 -m kaioken paths            # show where assets are being looked for
+```
+
+`kaioken` works as a bare command too, e.g. `kaioken start`.
+
+### Optional assets
+
+The wheel is ~170 KB and carries no model weights — the SAM2 encoder alone is
+109 MB. Both extras are downloaded on demand into a per-user cache
+(`~/.cache/kaioken` on Linux) and both are genuinely optional:
+
+```bash
+python3 -m kaioken fetch-assets --weights   # 23 MB, pretrained initialization
+python3 -m kaioken fetch-assets --sam2      # 126 MB, click-assist
+```
+
+Without the weights a model simply trains from scratch; without SAM2 the
+click-assist button stays disabled. Point at your own copies with
+`KAIOKEN_WEIGHTS` / `KAIOKEN_SAM2_DIR` instead, if you have them.
+
+### Export Executable
+
+"Export Executable" packages the standalone predictor with PyInstaller so a
+colleague can run your model without Python. It builds on demand and takes a
+few minutes, so it needs the export extra:
+
+```bash
+pip install "kaioken-segmenter[export]"
+```
+
+Without it the button stays disabled and says so. The result is a ~300 MB
+folder holding the `predictor` binary and your model as `model.onnx`; the
+binary opens a window when double-clicked and takes CLI flags otherwise
+(`predictor --help`).
+
+## Development
+
+```bash
+git clone https://github.com/raphi-web/kaioken_segmenter.git
+cd kaioken_segmenter
+python3 -m venv venv
+venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev,qt]"
+cd frontend && npm install && npm run build && cd ..
+venv/bin/python -m kaioken start          # defaults to 00.tiff
+venv/bin/python -m pytest
+```
+
+Run from a checkout and the asset lookups fall back to the repo's own
+`pretraining/`, `sam2/onnx/` and `frontend/dist/`, so nothing needs downloading.
+
+Building a wheel needs Node on the build machine — the frontend is compiled and
+bundled by `hatch_build.py`:
+
+```bash
+venv/bin/python -m build --wheel      # or KAIOKEN_SKIP_FRONTEND_BUILD=1 to reuse frontend/dist
+```
 
 ## How it works
 ### 1. Data & Classes
@@ -78,9 +140,11 @@ button stays disabled. The standalone predictor and "Export Executable" need
 
 - Model/State Dict: Saves training weights.
 - ONNX/Executable: Standalone predictor reproducing app inference (tiling, scaling, thresholding).
-- Mask: 1-band uint8 GeoTIFF (prediction + user labels) with original CRS/affine transform.## Frontend development
+- Mask: 1-band uint8 GeoTIFF (prediction + user labels) with original CRS/affine transform.
+
+## Frontend development
 
 ```bash
 cd frontend && npm run dev   # hot-reload UI (bridge calls need the pywebview host)
-npm run build                # rebuild dist/ used by backend/main.py
+npm run build                # rebuild dist/, which a checkout run picks up directly
 ```

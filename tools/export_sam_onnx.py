@@ -3,7 +3,7 @@
 Run once to produce the two ONNX graphs the app uses at runtime (see
 `sam_service.py`); PyTorch/hydra are only needed here, not when the app runs.
 
-    venv/bin/python backend/export_sam_onnx.py [--size tiny|small]
+    venv/bin/python tools/export_sam_onnx.py [--size tiny|small]
 
 The image predictor is split the same way the PyTorch predictor is used:
 

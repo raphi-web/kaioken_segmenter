@@ -16,7 +16,7 @@ probabilities, and the class index *is* the label value (0 target, 1 background)
 
 Run this module directly for both variants' shapes and parameter breakdown:
 
-    venv/bin/python backend/model.py
+    python -m kaioken.model
 """
 
 import os
@@ -25,6 +25,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from . import assets
 
 INPUT_SIZE = 96
 IN_CHANNELS = 10
@@ -68,12 +70,12 @@ BASE_CHANNELS_BY_BOTTLENECK = {"conv": CONV_BASE_CHANNELS,
 # budget if you want the comparison parameter-matched.
 BOTTLENECK_BLOCKS = 1
 
-# Weights pretrained on this architecture (kept outside the project), loaded as
-# the default initialization when present. They were trained at a different
-# patch size, class count and channel count than a given project may use, so the
-# load is filtered rather than strict -- see load_pretrained.
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_WEIGHTS = os.path.join(_ROOT, "pretraining", "pretrained.pth")
+# Weights pretrained on this architecture, loaded as the default initialization
+# when present -- downloaded on demand (python -m kaioken fetch-assets --weights),
+# so training from scratch still works without them. They were trained at a
+# different patch size, class count and channel count than a given project may
+# use, so the load is filtered rather than strict -- see load_pretrained.
+DEFAULT_WEIGHTS = str(assets.pretrained_weights())
 
 
 class DepthwiseSeparableConv(nn.Module):

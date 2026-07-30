@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kaioken-segmenter"
+dynamic = ["version"]
+description = "Human-in-the-loop semantic segmentation for remote sensing, with multi-band GeoTIFF support"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "raphi-web" }]
+keywords = ["remote-sensing", "segmentation", "geotiff", "labelling", "sentinel-2"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+# Note torch: a plain install pulls the CUDA build (~2.5 GB). A wheel cannot
+# pin an index, so CPU-only machines add the PyTorch CPU index at install time:
+#   pip install --extra-index-url https://download.pytorch.org/whl/cpu kaioken-segmenter
+dependencies = [
+    "torch>=2.0",
+    "segmentation-models-pytorch>=0.5",
+    "timm>=1.0",
+    "albumentations>=2.0",
+    "numpy>=1.26,<2",
+    "rasterio>=1.4,<1.5",
+    "pywebview>=6",
+    "pillow>=10",
+    "onnxruntime>=1.20",
+    "torchvision>=0.15",
+    "opencv-python-headless>=4.8",
+    "platformdirs>=3",
+]
+
+[project.optional-dependencies]
+# "Export Executable" builds the standalone predictor on demand.
+export = ["pyinstaller>=6"]
+# pywebview prefers GTK/WebKit2 (PyGObject + gir1.2-webkit2-4.1) when present;
+# this extra bundles Qt instead, so no system GTK is needed.
+qt = ["pywebview[qt]>=6"]
+dev = ["build", "pytest"]
+
+[project.scripts]
+kaioken = "kaioken.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/raphi-web/kaioken_segmenter"
+Issues = "https://github.com/raphi-web/kaioken_segmenter/issues"
+
+[tool.hatch.version]
+path = "src/kaioken/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kaioken"]
+# Built by hatch_build.py; not in git, so hatchling must be told to keep it.
+artifacts = ["src/kaioken/_frontend/**"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/kaioken", "frontend", "tests", "tools", "hatch_build.py", "README.md", "LICENSE"]
+exclude = ["frontend/node_modules", "frontend/dist"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

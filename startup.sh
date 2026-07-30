@@ -1,1 +1,1 @@
-./venv/bin/python3 ./backend/main.py
+./venv/bin/python3 -m kaioken start

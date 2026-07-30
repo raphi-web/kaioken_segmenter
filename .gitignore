@@ -1,6 +1,17 @@
-/standalone/build/
-/standalone/dist/
 /venv/
+/.venv/
 /frontend/dist/
 /frontend/node_modules/
 /.idea/
+
+# Packaging
+/dist/
+/build/
+*.egg-info/
+/src/kaioken/_frontend/
+
+__pycache__/
+*.py[cod]
+
+# Tooling artifacts
+/.code-graph.json

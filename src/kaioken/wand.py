@@ -19,8 +19,8 @@ per call and clears it when the pixels change; see WandSelector.bind / .clear.
 """
 
 import numpy as np
-from data import UNLABELED
-from sam_service import resize_bilinear
+from .data import UNLABELED
+from .sam_service import resize_bilinear
 
 try:
     import cv2  # only for the connected-component pass; see _connected_region

@@ -5,7 +5,7 @@ export default function Toolbar({
   onTrain, onStop, onUndo, onAdoptPrediction, onClearLabels, onExportModel,
   onExportOnnx, onExportExecutable, onExportMask, onAccuracyReport, onReset,
   hasProject, onNewProject, onNewFromGeotiff, onSaveProject, onSaveUserMask, onOpenSettings,
-  samAvailable, executableAvailable, classes,
+  samAvailable, executable, exportingExe, classes,
 }) {
   const training = status?.state === 'training'
   // The gap between the click and the first epoch is backend work, not idleness,
@@ -39,13 +39,13 @@ export default function Toolbar({
           <button onClick={onExportModel}>Export Model</button>
           <button onClick={onExportOnnx}>Export ONNX</button>
           <button
-            disabled={!executableAvailable}
-            title={executableAvailable
-              ? 'Export a clickable standalone predictor (executable + model.onnx)'
-              : 'Predictor executable not built (standalone/predictor.spec)'}
+            disabled={!executable?.available || exportingExe}
+            title={executable?.available
+              ? 'Build a clickable standalone predictor (executable + model.onnx). Takes a few minutes.'
+              : executable?.reason || 'Predictor cannot be built here'}
             onClick={onExportExecutable}
           >
-            Export Executable
+            {exportingExe ? 'Building Executable…' : 'Export Executable'}
           </button>
           <button onClick={onExportMask}>Export Mask</button>
           <button

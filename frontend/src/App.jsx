@@ -43,7 +43,8 @@ export default function App() {
   const [menuError, setMenuError] = useState('')
   const [report, setReport] = useState(null) // {result, error, progress} while the report modal is open
   const [samAvailable, setSamAvailable] = useState(false) // Efficient-SAM2 files present
-  const [executableAvailable, setExecutableAvailable] = useState(false) // prebuilt predictor present
+  const [executable, setExecutable] = useState({ available: false, reason: null }) // can PyInstaller build here
+  const [exportingExe, setExportingExe] = useState(false) // predictor build in flight
   const labelsRef = useRef(null)
   const undoStack = useRef([]) // Map<pixelIndex, previousValue> per stroke/fill
   const autosaveTimer = useRef(null)
@@ -81,7 +82,7 @@ export default function App() {
     api('get_project').then((p) => { if (p) setProject(p) })
     api('get_image').then(applyImagePayload)
     api('sam_available').then((r) => setSamAvailable(!!r.available))
-    api('executable_available').then((r) => setExecutableAvailable(!!r.available))
+    api('executable_available').then((r) => setExecutable({ available: !!r.available, reason: r.reason }))
   }, [])
 
   // Poll thumbnail generation while it runs; thumbnails appear as they finish.
@@ -271,6 +272,32 @@ export default function App() {
     const res = await api(method)
     if (res.ok) setMessage(`Saved: ${res.path}`)
     else if (res.error) setMessage(res.error)
+  }
+
+  // Unlike the other exports this one builds the predictor with PyInstaller,
+  // which takes minutes, so the backend returns immediately and we poll it.
+  async function handleExportExecutable() {
+    setMessage('')
+    const started = await api('export_executable')
+    if (!started.ok) {
+      if (started.error) setMessage(started.error)
+      return
+    }
+    setExportingExe(true)
+    try {
+      for (;;) {
+        const p = await api('export_executable_progress')
+        if (!p.running) {
+          if (p.error) setMessage(p.error)
+          else if (p.path) setMessage(`Saved: ${p.path}`)
+          return
+        }
+        setMessage(p.stage || 'Building…')
+        await new Promise((r) => setTimeout(r, 500))
+      }
+    } finally {
+      setExportingExe(false)
+    }
   }
 
   // Move one image between the training and validation sets. The backend
@@ -496,7 +523,7 @@ export default function App() {
         onClearLabels={handleClearLabels}
         onExportModel={() => handleExport('export_model')}
         onExportOnnx={() => handleExport('export_onnx')}
-        onExportExecutable={() => handleExport('export_executable')}
+        onExportExecutable={handleExportExecutable}
         onExportMask={() => handleExport('export_mask')}
         onAccuracyReport={handleAccuracyReport}
         onReset={handleReset}
@@ -507,7 +534,8 @@ export default function App() {
         onSaveUserMask={async () => { await pushLabels(); await handleExport('save_user_mask') }}
         onOpenSettings={handleOpenSettings}
         samAvailable={samAvailable}
-        executableAvailable={executableAvailable}
+        executable={executable}
+        exportingExe={exportingExe}
         classes={classes}
       />
       <div className="panes">

@@ -20,8 +20,8 @@ import albumentations as A
 import numpy as np
 import segmentation_models_pytorch as smp
 import torch
-from data import BACKGROUND, EXCLUDED, TARGET, UNLABELED
-from model import TransformerBottleneck
+from .data import BACKGROUND, EXCLUDED, TARGET, UNLABELED
+from .model import TransformerBottleneck
 
 BATCH_SIZE = 8
 LEARNING_RATE = 1.5e-3
