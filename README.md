@@ -39,13 +39,20 @@ renderer instead: `pip install "kaioken-segmenter[qt]"`.
 ### Commands
 
 ```bash
-python3 -m kaioken start [PATH]     # open the labelling app
-python3 -m kaioken fetch-assets     # download the optional model assets
-python3 -m kaioken predict IMG.tif  # run an exported model.onnx, no GUI
-python3 -m kaioken paths            # show where assets are being looked for
+python3 -m kaioken start [PATH]                     # open the labelling app
+python3 -m kaioken fetch-assets                     # download the optional model assets
+python3 -m kaioken predict -m model.onnx IMG.tif    # run an exported model, no GUI
+python3 -m kaioken paths                            # show where assets are being looked for
 ```
 
 `kaioken` works as a bare command too, e.g. `kaioken start`.
+
+`predict` runs a model **you exported** ("Export ONNX"), not the pretrained
+weights — so it always needs one. `-m/--model` defaults to `model.onnx` in the
+current directory, which is only convenient inside an exported folder; anywhere
+else, pass the path. It writes `IMG_prediction.tif` next to the input unless
+`-o` says otherwise; `python3 -m kaioken predict --help` lists band mapping,
+nodata and probability-raster options.
 
 ### Optional assets
 
@@ -92,12 +99,96 @@ venv/bin/python -m pytest
 Run from a checkout and the asset lookups fall back to the repo's own
 `pretraining/`, `sam2/onnx/` and `frontend/dist/`, so nothing needs downloading.
 
-Building a wheel needs Node on the build machine — the frontend is compiled and
-bundled by `hatch_build.py`:
+## Building the wheel
+
+### Prerequisites
+
+- **Python 3.10+** with the `build` package (`pip install build`, or `-e ".[dev]"`).
+- **Node.js / npm** — on the *build* machine only. The React UI is compiled here
+  and bundled into the wheel, so nobody installing it ever needs Node.
+
+### Build
 
 ```bash
-venv/bin/python -m build --wheel      # or KAIOKEN_SKIP_FRONTEND_BUILD=1 to reuse frontend/dist
+python3 -m build
 ```
+
+That is the whole thing. It writes two files to `dist/`:
+
+| File                                       | Size    | What it is             |
+| ------------------------------------------ | ------- | ---------------------- |
+| `kaioken_segmenter-0.1.0-py3-none-any.whl` | ~170 KB | the installable wheel  |
+| `kaioken_segmenter-0.1.0.tar.gz`           | ~140 KB | source distribution    |
+
+The wheel is `py3-none-any` — pure Python, so one build works on every platform
+and Python 3.10+.
+
+Under the hood `hatch_build.py` runs `npm ci && npm run build` in `frontend/` and
+copies the result into `src/kaioken/_frontend/`, which ships as package data. If
+that copy ends up empty the build **fails** rather than producing a wheel with no
+UI. To reuse a frontend you already built (CI, or no network):
+
+```bash
+cd frontend && npm run build && cd ..
+KAIOKEN_SKIP_FRONTEND_BUILD=1 python3 -m build --wheel
+```
+
+### Check what you built
+
+The wheel should carry the UI and **no** model assets — those are downloaded at
+runtime, and a stray `.pth` or `.onnx` would mean a ~450 MB wheel:
+
+```bash
+unzip -l dist/*.whl | grep _frontend            # expect index.html + assets/
+unzip -l dist/*.whl | grep -E '\.pth|\.onnx$'   # expect no matches
+```
+
+### Install it
+
+On the target machine, in a fresh venv:
+
+```bash
+python3 -m venv .venv
+# CPU-only torch (~200 MB); drop the extra index on a GPU machine to get CUDA
+.venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+    dist/kaioken_segmenter-0.1.0-py3-none-any.whl
+.venv/bin/python -m kaioken start
+```
+
+Add extras in the usual way — `"...whl[export]"` for the PyInstaller-backed
+"Export Executable", `[qt]` if the system has no GTK/WebKit2.
+
+Then confirm the install found everything:
+
+```bash
+.venv/bin/python -m kaioken paths
+```
+
+Run this from **outside** the repo. It should print `source tree : (installed,
+not a checkout)` and point the frontend at `site-packages/kaioken/_frontend/`.
+If it names the repo instead, you are running the checkout, not the wheel.
+
+### Releasing
+
+1. Bump `__version__` in `src/kaioken/__init__.py` — `pyproject.toml` reads the
+   version from there, so that is the only place to change it.
+2. `rm -rf dist/ && python3 -m build`
+3. Attach the `.whl` (and `.tar.gz` if you want) to a GitHub release.
+
+The model assets are versioned separately, under the `assets-v1` tag, because
+weights change far less often than code — see `ASSET_RELEASE` in
+`src/kaioken/assets.py`. Re-uploading 130 MB for a patch release is not needed;
+only publish new assets when the weights themselves change, and bump that tag in
+both places when you do.
+
+### Troubleshooting
+
+| Symptom                                         | Cause                                                                                                                           |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `npm not found on PATH`                         | Node missing. Install it, or prebuild `frontend/dist` and set `KAIOKEN_SKIP_FRONTEND_BUILD=1`.                                  |
+| `frontend build produced no .../index.html`     | The Vite build failed — scroll up for its error.                                                                                |
+| `paths` names the repo after installing a wheel | The venv is inside the checkout *and* you are running from `src/`. Check `python -c "import kaioken; print(kaioken.__file__)"`. |
+| Torch pulls gigabytes                           | The CUDA build is the default. Add `--extra-index-url https://download.pytorch.org/whl/cpu`.                                    |
 
 ## How it works
 ### 1. Data & Classes
