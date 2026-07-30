@@ -20,7 +20,7 @@ import albumentations as A
 import numpy as np
 import segmentation_models_pytorch as smp
 import torch
-from data import EXCLUDED, TARGET, UNLABELED
+from data import BACKGROUND, EXCLUDED, TARGET, UNLABELED
 from model import TransformerBottleneck
 
 BATCH_SIZE = 8
@@ -397,6 +397,21 @@ def train(model, samples, epochs, progress=None, stop_event=None):
 
                 sup_target = mask.masked_fill(mask == EXCLUDED, UNLABELED).long()
                 labeled = sup_target != UNLABELED
+                # Collapse to the binary space the network actually has. A mask
+                # may carry class ids from a richer taxonomy than the model --
+                # this dataset's rasters use 0..9 against a 2-class net -- and
+                # cross-entropy reads the label as a CHANNEL INDEX, so a 7 is
+                # not "some other class", it is an out-of-bounds gather.
+                #
+                # Everything labelled and not TARGET becomes BACKGROUND, which
+                # restores exactly what the pre-2-class model did: it emitted one
+                # logit and trained on `(label == TARGET)`, so any other id was
+                # already background by construction. The rest of the app agrees
+                # -- predict_image returns two channels and report.confusion
+                # scores TARGET against everything else.
+                sup_target = torch.where(labeled & (sup_target != TARGET),
+                                         torch.full_like(sup_target, BACKGROUND),
+                                         sup_target)
 
                 with torch.no_grad():
                     pred_t = (logits.argmax(1) == TARGET) & labeled
