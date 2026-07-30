@@ -47,9 +47,15 @@ button stays disabled. The standalone predictor and "Export Executable" need
 
 ### 2. Model Architecture
 
-- Core: encoder/decoder net (~5.7M params) trained from scratch — residual
-  depthwise-separable CNN encoder, a small transformer bottleneck at 1/16 scale,
-  and a decoder with skip connections and channel attention.
+- Core: encoder/decoder net trained from scratch — residual depthwise-separable
+  CNN encoder, a decoder with skip connections and channel attention, and a
+  selectable bottleneck at 1/16 scale (project setting `data_profile.bottleneck`):
+  - `conv` (default): plain conv block, 64 base channels, ~3.0M params. Measured
+    better on 10 m/px imagery — mean best IoU 0.535 vs 0.428 over 3 seeds — at
+    half the size.
+  - `transformer`: pre-norm transformer block, 44 base channels, ~5.7M params.
+    Kept for higher-resolution imagery, where features at the scale attention
+    exploits are more likely to exist.
 - Input: Raw bands, processed in 96×96 patches (default; any multiple of 16).
 - Output: One logit per class per pixel; softmax gives the class probabilities.
 - Inference: Uses overlapping tiles with logit averaging for smooth, full-image results.

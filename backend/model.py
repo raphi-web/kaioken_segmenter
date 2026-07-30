@@ -1,13 +1,22 @@
-"""Hybrid CNN/transformer segmentation net over the raw input bands.
+"""Segmentation nets over the raw input bands, in two bottleneck flavours.
 
-Encoder: residual depthwise-separable blocks with strided (learned) downsampling,
-four stages, so the bottleneck sits at 1/16 of the input. Bottleneck: a small
-pre-norm transformer encoder over the 1/16 grid. Decoder: transposed-conv upsampling
-with skip concatenation and channel attention. Head: a 1x1 conv to per-class logits,
-optionally refined by a PointRend point head on the most uncertain pixels.
+Shared by both: an encoder of residual depthwise-separable blocks with strided
+(learned) downsampling, four stages, so the bottleneck sits at 1/16 of the input;
+a decoder of transposed-conv upsampling with skip concatenation and channel
+attention; and a 1x1 conv head to per-class logits, optionally refined by a
+PointRend point head on the most uncertain pixels.
+
+Only the 1/16 stage differs, and it is a per-project setting (see BOTTLENECKS):
+
+    ConvBridgeNetwork      conv blocks       the default
+    HybridBridgeNetwork    transformer       kept for higher-resolution imagery
 
 The net emits NUM_CLASSES logits per pixel; softmax over them gives the class
 probabilities, and the class index *is* the label value (0 target, 1 background).
+
+Run this module directly for both variants' shapes and parameter breakdown:
+
+    venv/bin/python backend/model.py
 """
 
 import os
@@ -29,6 +38,36 @@ BASE_CHANNELS = 44
 TRANSFORMER_DEPTH = 3
 TRANSFORMER_HEADS = 4
 STOCHASTIC_DEPTH_PROB = 0.1
+
+# Selectable bottleneck, per project (data_profile.bottleneck). The encoder,
+# decoder and PointRend head are identical either way; only the lowest-resolution
+# stage differs, along with the channel width each variant is tuned for.
+#
+#   "conv"         plain conv block (ConvBridgeNetwork), base 64
+#   "transformer"  pre-norm transformer encoder (HybridBridgeNetwork), base 44
+#
+# "conv" is the default on the evidence: measured over 3 seeds on a synthetic
+# task with a weak 3-of-10-band signal, it reached mean best IoU 0.535 against
+# the transformer's 0.428, and did it with 2.97M parameters against 5.65M. The
+# transformer stays available because that measurement is one synthetic tile at
+# 10 m/px, where there is plausibly nothing at the scale attention exploits --
+# the ordering could well flip on higher-resolution imagery.
+BOTTLENECKS = ("conv", "transformer")
+DEFAULT_BOTTLENECK = "conv"
+# base_channels per variant: replacing the transformer frees ~4M parameters, and
+# the conv variant spends part of that on a wider convolutional path instead.
+# Channel counts scale roughly quadratically through DoubleConv/Up, so 44 -> 64
+# is about 2.1x on every conv stage -- and the net is still 2.97M parameters
+# against the transformer variant's 5.65M.
+CONV_BASE_CHANNELS = 64
+BASE_CHANNELS_BY_BOTTLENECK = {"conv": CONV_BASE_CHANNELS,
+                               "transformer": BASE_CHANNELS}
+# Stacked DoubleConv blocks at a conv bottleneck. One is the classic U-Net shape
+# (its bottleneck is a single two-conv block); 2+ deepens the lowest-resolution
+# stage, which is the cheapest place to add depth -- each block is ~536k
+# parameters at 64 base channels, so 4 would roughly match the transformer's
+# budget if you want the comparison parameter-matched.
+BOTTLENECK_BLOCKS = 1
 
 # Weights pretrained on this architecture (kept outside the project), loaded as
 # the default initialization when present. They were trained at a different
@@ -381,6 +420,119 @@ class HybridBridgeNetwork(nn.Module):
         return refined_logits
 
 
+class ConvBottleneck(nn.Module):
+    """The classic U-Net bottleneck: conv blocks at the lowest resolution.
+
+    Same in/out channel count as TransformerBottleneck, so it drops straight
+    into the decoder without touching any Up block. Unlike the transformer it has
+    no positional embedding and therefore no dependence on the input size, which
+    is what lets its variant accept any patch size that is a multiple of 16, keep
+    checkpoints portable across patch sizes, and export to ONNX with dynamic
+    spatial axes (see SegmentationModel.variable_input).
+    """
+
+    def __init__(self, channels, blocks=BOTTLENECK_BLOCKS, drop_prob=0.0):
+        super().__init__()
+        self.blocks = nn.Sequential(*[
+            DoubleConv(channels, channels, drop_prob=drop_prob)
+            for _ in range(blocks)
+        ])
+
+    def forward(self, x):
+        return self.blocks(x)
+
+
+class ConvBridgeNetwork(nn.Module):
+    """HybridBridgeNetwork with ConvBottleneck in place of the transformer.
+
+    The project default (data_profile.bottleneck == "conv"); see BOTTLENECKS for
+    the measurements behind that. Everything outside the bottleneck -- the
+    encoder, the decoder, the PointRend head -- is the same blocks the
+    transformer variant uses, so the bottleneck really is the only difference,
+    apart from the wider base_channels that replacing it pays for.
+
+    Keeps HybridBridgeNetwork's forward signature and attribute names (down1..4,
+    bottleneck, up4..1, final_conv, point_rend), so train.py's parameter
+    grouping, api.py's checkpoint filter and the ONNX export all work against
+    either variant without asking which one they have.
+
+    train.BOTTLENECK_LR deliberately does NOT apply here: it exists for the
+    attention block, and holding a conv block back at the same rate cost 0.026
+    mean best IoU in the A/B. train._bottleneck_lr selects by module type, so
+    this bottleneck trains at the full LEARNING_RATE.
+    """
+
+    def __init__(
+        self,
+        in_channels=IN_CHANNELS,
+        num_classes=NUM_CLASSES,
+        base_channels=CONV_BASE_CHANNELS,
+        bottleneck_blocks=BOTTLENECK_BLOCKS,
+        point_rend_num_points=(INPUT_SIZE * INPUT_SIZE) // POINT_RATIO,
+        point_rend_hidden_channels=POINT_HIDDEN,
+        stochastic_depth_prob=STOCHASTIC_DEPTH_PROB,
+        use_pointrend=False,
+    ):
+        super().__init__()
+        c1, c2, c3, c4 = (
+            base_channels,
+            base_channels * 2,
+            base_channels * 4,
+            base_channels * 8,
+        )
+        # One extra entry over HybridBridgeNetwork's eight: the bottleneck is a
+        # residual block here too, so it takes a stochastic-depth rate of its own
+        # and the schedule stays monotonic across the whole depth of the net.
+        num_blocks = 9
+        dpr = [stochastic_depth_prob * i / max(num_blocks - 1, 1) for i in range(num_blocks)]
+
+        # --- ENCODER --- (identical to the transformer variant)
+        self.down1 = Down(in_channels, c1, drop_prob=dpr[0])
+        self.down2 = Down(c1, c2, drop_prob=dpr[1])
+        self.down3 = Down(c2, c3, drop_prob=dpr[2])
+        self.down4 = Down(c3, c4, drop_prob=dpr[3])
+
+        # --- BOTTLENECK --- (the one architectural difference)
+        self.bottleneck = ConvBottleneck(c4, blocks=bottleneck_blocks, drop_prob=dpr[4])
+
+        # --- DECODER --- (identical to the transformer variant)
+        self.up4 = Up(c4, c4, c3, drop_prob=dpr[5])
+        self.up3 = Up(c3, c3, c2, drop_prob=dpr[6])
+        self.up2 = Up(c2, c2, c1, drop_prob=dpr[7])
+        self.up1 = Up(c1, c1, c1, drop_prob=dpr[8])
+
+        self.final_conv = nn.Conv2d(c1, num_classes, kernel_size=1)
+        self.use_pointrend = use_pointrend
+        self.point_rend = (
+            PointRendModule(
+                fine_channels=c1,
+                num_classes=num_classes,
+                hidden_channels=point_rend_hidden_channels,
+                num_points=point_rend_num_points,
+            )
+            if use_pointrend
+            else None
+        )
+
+    def forward(self, x, return_coarse=False):
+        x, skip1 = self.down1(x)
+        x, skip2 = self.down2(x)
+        x, skip3 = self.down3(x)
+        x, skip4 = self.down4(x)
+        x = self.bottleneck(x)
+        x = self.up4(x, skip4)
+        x = self.up3(x, skip3)
+        x = self.up2(x, skip2)
+        x = self.up1(x, skip1)
+        coarse_logits = self.final_conv(x)  # (B, classes, H, W)
+        if self.point_rend is None:
+            return (coarse_logits, coarse_logits) if return_coarse else coarse_logits
+        refined_logits = self.point_rend(coarse_logits, skip1)
+        if return_coarse:
+            return refined_logits, coarse_logits
+        return refined_logits
+
+
 def _resize_pos_embed(weight, tokens):
     """Resample a (1, N, D) positional embedding to `tokens` positions.
 
@@ -447,10 +599,11 @@ def load_pretrained(net, path):
 class SegmentationModel:
     """Wraps the network with patch-tiled inference and (de)serialization.
 
-    in_channels / patch_size come from the project's data_profile. The patch size
-    also sizes the bottleneck's positional embedding and the point head's budget,
-    so a trained checkpoint is only portable between projects that share it; the
-    pretrained weights are adapted across the difference by load_pretrained.
+    in_channels / patch_size / bottleneck come from the project's data_profile.
+    A trained checkpoint is only portable between projects that agree on all
+    three: the bottleneck decides the architecture, and under "transformer" the
+    patch size additionally sizes the positional embedding. The pretrained
+    weights are adapted across what can be adapted by load_pretrained.
     """
 
     def __init__(
@@ -460,11 +613,16 @@ class SegmentationModel:
         in_channels=IN_CHANNELS,
         patch_size=INPUT_SIZE,
         use_pointrend=False,
+        bottleneck=DEFAULT_BOTTLENECK,
     ):
         if patch_size % 16 != 0:
             raise ValueError(
                 f"input_patch_size must be a multiple of 16 "
                 f"(encoder downsamples 16x), got {patch_size}"
+            )
+        if bottleneck not in BOTTLENECKS:
+            raise ValueError(
+                f"bottleneck must be one of {BOTTLENECKS}, got {bottleneck!r}"
             )
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -472,14 +630,42 @@ class SegmentationModel:
         self.in_channels = in_channels
         self.patch_size = patch_size
         self.use_pointrend = use_pointrend
-        self.net = HybridBridgeNetwork(
-            in_channels=in_channels,
-            num_classes=NUM_CLASSES,
-            max_input_size=patch_size,
-            point_rend_num_points=max(1, (patch_size * patch_size) // POINT_RATIO),
-            use_pointrend=use_pointrend,
-        ).to(self.device)
+        self.bottleneck = bottleneck
+        base_channels = BASE_CHANNELS_BY_BOTTLENECK[bottleneck]
+        points = max(1, (patch_size * patch_size) // POINT_RATIO)
+        if bottleneck == "conv":
+            net = ConvBridgeNetwork(
+                in_channels=in_channels,
+                num_classes=NUM_CLASSES,
+                base_channels=base_channels,
+                point_rend_num_points=points,
+                use_pointrend=use_pointrend,
+            )
+        else:
+            net = HybridBridgeNetwork(
+                in_channels=in_channels,
+                num_classes=NUM_CLASSES,
+                base_channels=base_channels,
+                max_input_size=patch_size,
+                point_rend_num_points=points,
+                use_pointrend=use_pointrend,
+            )
+        self.net = net.to(self.device)
         self.pretrained_tensors = load_pretrained(self.net, weights)
+
+    @property
+    def variable_input(self):
+        """Whether the net accepts input sizes other than the one it was built for.
+
+        The transformer bottleneck's positional embedding is a learned parameter
+        sized for exactly one token grid, so that variant is pinned to its patch
+        size. The conv bottleneck has no size-dependent parameter and runs at any
+        multiple of 16 (the encoder's total stride).
+
+        Read by api._write_model_onnx to decide whether the exported graph may
+        declare its spatial axes dynamic.
+        """
+        return self.bottleneck == "conv"
 
     def predict_image(self, image):
         """Full-image class map via overlapping tiles with logit averaging.
@@ -515,3 +701,45 @@ class SegmentationModel:
 
     def load(self, path):
         self.net.load_state_dict(torch.load(path, map_location=self.device))
+
+
+def _compare_variants():
+    """Side-by-side shapes and parameter split for the two bottlenecks.
+
+    Handy when tuning either one: the per-module columns show where the budget
+    goes, and the totals show what swapping the bottleneck costs or frees.
+    """
+    def size_of(module):
+        return sum(p.numel() for p in module.parameters())
+
+    built = {name: SegmentationModel(in_channels=IN_CHANNELS, patch_size=INPUT_SIZE,
+                                     bottleneck=name, use_pointrend=True,
+                                     weights=None).net
+             for name in BOTTLENECKS}
+    dummy = torch.randn(1, IN_CHANNELS, INPUT_SIZE, INPUT_SIZE)
+    for name, variant in built.items():
+        variant.eval()
+        with torch.no_grad():
+            refined, coarse = variant(dummy, return_coarse=True)
+        print(f"{name:12s} in {tuple(dummy.shape)} -> coarse {tuple(coarse.shape)}"
+              f" -> refined {tuple(refined.shape)}")
+
+    conv, hybrid = built["conv"], built["transformer"]
+    print(f"\n{'module':<14}{f'conv (base {CONV_BASE_CHANNELS})':>20}"
+          f"{f'transformer (base {BASE_CHANNELS})':>24}")
+    for name, module in conv.named_children():
+        twin = getattr(hybrid, name, None)
+        twin_size = f"{size_of(twin):,}" if twin is not None else "-"
+        print(f"  {name:<12}{size_of(module):>20,}{twin_size:>24}")
+    print(f"  {'TOTAL':<12}{size_of(conv):>20,}{size_of(hybrid):>24,}")
+
+    # Only the conv variant is size-agnostic: no positional embedding, so no
+    # largest-input constraint (see SegmentationModel.variable_input).
+    for side in (64, 128, 256):
+        with torch.no_grad():
+            logits = conv(torch.randn(1, IN_CHANNELS, side, side))
+        print(f"conv at {side:>4}px  {tuple(logits.shape)}")
+
+
+if __name__ == "__main__":
+    _compare_variants()

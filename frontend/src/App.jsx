@@ -389,6 +389,7 @@ export default function App() {
         band_names: dp.band_names ?? [],
         display_bands: dp.display_bands,
         use_pointrend: dp.use_pointrend ?? false,
+        bottleneck: dp.bottleneck ?? 'conv',
         validation_ratio: project.validation_ratio ?? 0.2,
         images_folder: project.paths.images_folder,
         masks_user: project.paths.masks_user,

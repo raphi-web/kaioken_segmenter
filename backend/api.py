@@ -25,7 +25,7 @@ import report as report_module
 import train as train_module
 from data import (UNLABELED, SentinelImage, array_to_png_b64, tile_geotiff,
                   write_mask_geotiff)
-from model import SegmentationModel
+from model import DEFAULT_BOTTLENECK, SegmentationModel
 from project import (DEFAULT_CLASSES, SPLIT_ROLES, Project,
                      config_from_settings, config_path, default_config,
                      default_split, deterministic_validation,
@@ -815,6 +815,7 @@ class Api:
             "state_dict": self._model.net.state_dict(),
             "in_channels": self._model.in_channels,
             "use_pointrend": self._model.use_pointrend,
+            "bottleneck": self._model.bottleneck,
             "total_epochs": self._status["total_epochs"],
         }, tmp)
         os.replace(tmp, path)
@@ -829,6 +830,13 @@ class Api:
         PointRend adds/removes the point head, and the shared encoder/decoder
         weights must survive the toggle in either direction. The same filter
         discards checkpoints written by an older architecture.
+
+        The bottleneck is checked outright rather than left to that filter. The
+        two variants share every module name in the encoder and decoder, so a
+        mismatched checkpoint would load whatever happened to agree on shape and
+        then report its epoch count -- a model that is part-trained, part-fresh,
+        claiming to be fully trained. A checkpoint with no `bottleneck` key
+        predates the choice and was necessarily a transformer.
         """
         path = project.model_checkpoint_path
         if not os.path.exists(path):
@@ -836,6 +844,8 @@ class Api:
         try:
             ckpt = torch.load(path, map_location=model.device, weights_only=True)
             if ckpt.get("in_channels") != model.in_channels:
+                return 0
+            if ckpt.get("bottleneck", "transformer") != model.bottleneck:
                 return 0
             model_state = model.net.state_dict()
             state = {
@@ -857,7 +867,8 @@ class Api:
         with self._lock:
             self._model = SegmentationModel(in_channels=self._model.in_channels,
                                             patch_size=self._model.patch_size,
-                                            use_pointrend=self._model.use_pointrend)
+                                            use_pointrend=self._model.use_pointrend,
+                                            bottleneck=self._model.bottleneck)
             self._model_version += 1
             self._class_map = None
             self._probs = None
@@ -900,6 +911,8 @@ class Api:
                     "band_names": config["data_profile"]["band_names"],
                     "display_bands": config["data_profile"]["display_bands"],
                     "use_pointrend": config["data_profile"]["use_pointrend"],
+                    "bottleneck": config["data_profile"].get(
+                        "bottleneck", DEFAULT_BOTTLENECK),
                     "validation_ratio": config["split"]["validation_ratio"],
                     "images_folder": config["paths"]["images_folder"],
                     "masks_user": config["paths"]["masks_user"],
@@ -944,6 +957,8 @@ class Api:
                     "band_names": band_names,
                     "display_bands": config["data_profile"]["display_bands"],
                     "use_pointrend": config["data_profile"]["use_pointrend"],
+                    "bottleneck": config["data_profile"].get(
+                        "bottleneck", DEFAULT_BOTTLENECK),
                     "validation_ratio": config["split"]["validation_ratio"],
                     "images_folder": "images",
                     "masks_user": config["paths"]["masks_user"],
@@ -1087,7 +1102,8 @@ class Api:
                 created = True
             model = SegmentationModel(in_channels=project.input_channels,
                                       patch_size=project.patch_size,
-                                      use_pointrend=project.use_pointrend)
+                                      use_pointrend=project.use_pointrend,
+                                      bottleneck=project.bottleneck)
         except (OSError, ValueError) as e:
             return {"ok": False, "error": str(e)}
         restored_epochs = self._load_model_checkpoint(model, project)
@@ -1180,14 +1196,19 @@ class Api:
         self._project.config = config
         result = {"ok": True, "project": self.get_project()}
         if (config["data_profile"]["use_pointrend"]
-                != bool(profile.get("use_pointrend", False))):
-            # The point head is part of the network: rebuild the model with the
-            # new flag and re-restore the checkpoint (filtered, so the trained
-            # U-Net weights survive; a fresh/dropped point head is expected).
+                != bool(profile.get("use_pointrend", False))
+                or config["data_profile"]["bottleneck"]
+                != profile.get("bottleneck", DEFAULT_BOTTLENECK)):
+            # Both are part of the network, so rebuild and re-restore the
+            # checkpoint. Toggling PointRend keeps the trained weights (the
+            # filtered load survives adding/dropping the point head); switching
+            # the bottleneck is a different architecture, so _load_model_checkpoint
+            # rejects the old checkpoint outright and training starts over.
             with self._lock:
                 model = SegmentationModel(in_channels=self._model.in_channels,
                                           patch_size=self._model.patch_size,
-                                          use_pointrend=self._project.use_pointrend)
+                                          use_pointrend=self._project.use_pointrend,
+                                          bottleneck=self._project.bottleneck)
                 self._status["total_epochs"] = self._load_model_checkpoint(
                     model, self._project)
                 self._model = model
@@ -1215,7 +1236,12 @@ class Api:
             "root": self._project.root,
             "name": self._project.config["project_name"],
             "classes": self._project.config["classes"],
-            "data_profile": self._project.config["data_profile"],
+            # Reported with the bottleneck resolved rather than raw: a config
+            # predating the key has none, and the payload should name the
+            # architecture that was actually built, not leave the frontend to
+            # re-derive the default.
+            "data_profile": {**self._project.config["data_profile"],
+                             "bottleneck": self._project.bottleneck},
             "paths": self._project.config["paths"],
             "images": self._project.list_images(),
             "validation": self._project.validation_names(),
@@ -1486,13 +1512,17 @@ class Api:
         return {"ok": True, "path": path}
 
     def export_onnx(self):
-        """Export the U-Net to ONNX for portable inference.
+        """Export the network to ONNX for portable inference.
 
         Graph: input (N, C, H, W) float32 of per-band normalized bands (the same
         [0,1] robust-percentile normalization used in training) -> logits
-        (N, 1, H, W); sigmoid(logit) = P(target), so class 0 (target) is the
-        positive class and 1 (background) its complement. Batch and spatial dims
-        are dynamic (H and W must stay multiples of 32, the encoder's stride).
+        (N, 2, H, W); softmax over the channel axis gives the class
+        probabilities, and the channel index is the label value (0 target,
+        1 background).
+
+        The batch axis is always dynamic. H and W are dynamic for the conv
+        bottleneck (multiples of 16, at least 32) and fixed at the project's
+        patch size for the transformer one; see _write_model_onnx.
         """
         if self._status["state"] == "training":
             return {"ok": False, "error": "Wait for training to finish"}
@@ -1509,22 +1539,41 @@ class Api:
     def _write_model_onnx(self, path):
         """Export the network to `path` as ONNX (+ metadata). Shared by exports.
 
-        Only the batch axis is dynamic. The bottleneck's positional embedding is
-        sized for exactly one patch size, and both consumers (predict_image and
-        the standalone predictor) only ever feed patch_size tiles, so declaring
-        the spatial axes dynamic would only advertise sizes the graph cannot
-        actually serve.
+        The spatial axes are declared dynamic only when the architecture can
+        actually serve other sizes (SegmentationModel.variable_input): the
+        transformer bottleneck's positional embedding is sized for one token grid,
+        so that variant is pinned to its patch size and advertising H/W as
+        dynamic would promise sizes the graph cannot honour.
+
+        For the conv variant the dynamic range is real but not unlimited, because
+        tracing bakes in two size-dependent decisions:
+
+          * H and W must stay MULTIPLES OF 16. Whether a decoder stage needs its
+            interpolate fallback is decided at trace time, and at a multiple of 16
+            the ConvTranspose2d doubling always lines up with the skip, so the
+            fallback is not in the graph at all -- feed a non-multiple and the
+            concat fails on mismatched shapes instead of silently resizing.
+          * The PointRend point budget is a constant in the graph
+            (min(num_points, H*W) at trace time), so H*W must not fall below it.
+            With the default 1/16 budget that means no smaller than 32x32.
+
+        Both are recorded in the metadata rather than left for a consumer to
+        discover, and neither binds the standalone predictor, which tiles at
+        patch_size to keep matching the in-app path exactly.
         """
         with self._lock:
             net = self._model.net
             net.eval()
             channels, size = self._model.in_channels, self._model.patch_size
             dummy = torch.zeros(1, channels, size, size, device=self._model.device)
+            axes = {0: "batch"}
+            if self._model.variable_input:
+                axes.update({2: "height", 3: "width"})
             torch.onnx.export(
                 net, dummy, path,
                 input_names=["input"], output_names=["logits"],
                 opset_version=17, dynamo=False,
-                dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+                dynamic_axes={"input": dict(axes), "logits": dict(axes)},
             )
         self._annotate_onnx(path)
 
@@ -1541,9 +1590,18 @@ class Api:
                 "in_channels": str(self._model.in_channels),
                 "patch_size": str(self._model.patch_size),
                 "use_pointrend": str(self._model.use_pointrend),
+                "bottleneck": str(self._model.bottleneck),
                 "band_names": json.dumps(profile.get("band_names", [])),
                 "output": "logits; softmax over 2 channels; classes 0=target 1=background",
                 "input_normalization": "per-band 2-98 percentile robust scaling to [0,1]",
+                # What the graph will actually accept, so a consumer does not
+                # have to infer it from the architecture (see _write_model_onnx).
+                "input_size": (
+                    f"H,W dynamic; multiples of 16, min 32 "
+                    f"(exported at {self._model.patch_size})"
+                    if self._model.variable_input
+                    else f"H,W fixed at {self._model.patch_size}"
+                ),
             })
             onnx.save(model, path)
         except Exception:

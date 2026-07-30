@@ -16,6 +16,11 @@ import rasterio
 from PIL import Image
 from rasterio.enums import Resampling
 
+# model.py owns the list of architectures; this module only validates that the
+# config names one of them. (model.py does not import this one, so there is no
+# cycle, and api.py -- project.py's only consumer -- already imports both.)
+from model import BOTTLENECKS, DEFAULT_BOTTLENECK
+
 CONFIG_NAME = "project_config.json"
 THUMB_DIR = ".thumbnails"
 THUMB_SIZE = 128
@@ -104,7 +109,8 @@ def default_config(project_name, input_channels=10, patch_size=96):
                          "input_patch_size": [patch_size, patch_size],
                          "band_names": default_band_names(input_channels),
                          "display_bands": default_display_bands(input_channels),
-                         "use_pointrend": False},
+                         "use_pointrend": False,
+                         "bottleneck": DEFAULT_BOTTLENECK},
         "classes": [dict(c) for c in DEFAULT_CLASSES],
         "split": default_split(),
         "paths": {"images_folder": ".", "masks_user": "masks_user", "masks_ai": "masks_ai"},
@@ -143,6 +149,9 @@ def config_from_settings(settings):
             "band_names": [str(n).strip() for n in names],
             "display_bands": display,
             "use_pointrend": bool(settings.get("use_pointrend", False)),
+            "bottleneck": (settings.get("bottleneck")
+                           if settings.get("bottleneck") in BOTTLENECKS
+                           else DEFAULT_BOTTLENECK),
         },
         "classes": [dict(c) for c in DEFAULT_CLASSES],
         # Overrides are per-image and only exist once the user moves one, so a
@@ -207,6 +216,11 @@ def validate_config(config):
     if use_pointrend is not None:  # optional: older configs default to off
         expect(isinstance(use_pointrend, bool),
                "'data_profile.use_pointrend' must be a boolean")
+
+    bottleneck = profile.get("bottleneck")
+    if bottleneck is not None:  # optional: older configs predate the choice
+        expect(bottleneck in BOTTLENECKS,
+               f"'data_profile.bottleneck' must be one of {list(BOTTLENECKS)}")
 
     display_bands = profile.get("display_bands")
     if display_bands is not None:  # optional: older configs default to first three
@@ -344,6 +358,17 @@ class Project:
     def use_pointrend(self):
         """Whether the model refines uncertain pixels with the PointRend head."""
         return self.config["data_profile"].get("use_pointrend", False)
+
+    @property
+    def bottleneck(self):
+        """Which bottleneck the model uses: "conv" or "transformer".
+
+        Configs written before the choice existed have no key and get the
+        default. They were all trained on the transformer, so such a project's
+        checkpoint will not match the model built for it -- api._load_model_checkpoint
+        detects that and starts clean rather than restoring a phantom epoch count.
+        """
+        return self.config["data_profile"].get("bottleneck", DEFAULT_BOTTLENECK)
 
     @property
     def split(self):

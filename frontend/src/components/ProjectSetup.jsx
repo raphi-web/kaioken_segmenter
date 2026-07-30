@@ -308,6 +308,33 @@ export default function ProjectSetup({ mode = 'create', root, source, defaults, 
         </div>
 
         <div className="form-row">
+          <label title="Which block sits at the deepest, lowest-resolution stage of the network. The encoder, decoder and boundary refinement are the same either way.">
+            Bottleneck
+          </label>
+          <div className="segmented">
+            {[
+              ['conv', 'Conv', 'Plain convolutional bottleneck, 64 base channels (2.97M params). Measured better than the transformer on 10 m/px imagery and half the size.'],
+              ['transformer', 'Transformer', 'Pre-norm transformer bottleneck, 44 base channels (5.65M params). Worth trying on higher-resolution imagery, where features at the scale attention exploits are more likely to exist.'],
+            ].map(([value, label, title]) => (
+              <button
+                key={value}
+                type="button"
+                className={(form.bottleneck ?? 'conv') === value ? 'active' : ''}
+                title={title}
+                onClick={() => set('bottleneck', value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <span className="hint">
+            {editing
+              ? 'changing this rebuilds the model — training starts over'
+              : 'conv is recommended'}
+          </span>
+        </div>
+
+        <div className="form-row">
           <label title="Re-classify the most uncertain pixels with a small PointRend head for sharper boundaries">
             Boundary refinement
           </label>
