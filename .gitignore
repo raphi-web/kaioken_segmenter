@@ -1,5 +1,6 @@
 /venv/
 /.venv/
+/venv-rocm/
 /frontend/dist/
 /frontend/node_modules/
 /.idea/

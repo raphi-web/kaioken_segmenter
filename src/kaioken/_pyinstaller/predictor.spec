@@ -43,7 +43,8 @@ a = Analysis(
               "IPython", "webview", "segmentation_models_pytorch",
               "kaioken.api", "kaioken.app", "kaioken.cli", "kaioken.assets",
               "kaioken.data", "kaioken.model", "kaioken.project",
-              "kaioken.report", "kaioken.sam_service", "kaioken.train"],
+              "kaioken.report", "kaioken.sam_service", "kaioken.train",
+              "kaioken.wand"],
     noarchive=False,
 )
 

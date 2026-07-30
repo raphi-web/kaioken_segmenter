@@ -700,7 +700,7 @@ class SegmentationModel:
         class_map is in label space (= model class space): 0 target, 1 background,
         255 where the image has no valid data.
         """
-        from data import UNLABELED, blend_tiles
+        from .data import UNLABELED, blend_tiles
 
         self.net.eval()
         corners = image.patch_grid()
