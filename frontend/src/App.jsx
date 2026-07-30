@@ -533,7 +533,6 @@ export default function App() {
           onSamSnap={handleSamSnap}
           onWandSelect={handleWandSelect}
           classColors={classColors}
-          classes={classes}
           samAvailable={samAvailable}
         />
       </div>

@@ -27,48 +27,22 @@ export const WAND_TOL_SCALE = 200
 export const WAND_SAM_TOL_MIN = 0.4
 export const WAND_SAM_TOL_SPAN = 0.8
 
-// Per-class starting tolerance, in slider units. What counts as "the same
-// material" is a property of the material: the measured per-class optima span
-// 0.07 to 0.19, and one global number is a compromise weighted toward whichever
-// class the project has most of. Measured over 388 regions across 20 images by
-// clicking the most interior pixel of each connected labeled region: seeded per
-// class scores 0.397 mean IoU against 0.353 for a flat 0.13 (+12.4%), the share
-// of regions reaching IoU>=0.5 rises 30.9% -> 36.3%, and median over-selection
-// halves, 10.6% -> 4.7%.
+// Starting tolerance, in slider units. One number, because this app is a binary
+// Target/Background segmenter -- there is no material taxonomy to seed from.
 //
-// Keyed by class NAME, not id -- these are properties of the material and ids
-// are per project. Matching is case-insensitive and falls back to a prefix, so
-// both a short name and this dataset's fuller ones ("Raw-Earth/Agriculture",
-// "Agriculture-Green") resolve to the same seed.
-export const WAND_TOLERANCE_SEEDS = {
-  urban: 38,        // 0.19
-  'raw-earth': 28,  // 0.14
-  road: 24,         // 0.12
-  forest: 22,       // 0.11
-  wetland: 22,      // 0.11
-  shrub: 20,        // 0.10
-  meadow: 18,       // 0.09
-  agri: 18,         // 0.09
-  water: 14,        // 0.07
-}
-
-// The fallback cannot be improved on as a single number: over those same 388
-// regions the best fixed setting is 0.14 at 0.349 mean IoU against 0.347 for
+// (A per-class seed table keyed to a multi-class taxonomy lived here briefly.
+// It came from the separate kaioken_labeler project and never matched anything
+// in a Target/Background palette, so every class already fell through to this
+// value. Per-class seeding only makes sense where the classes name materials.)
+//
+// It cannot be improved on as a single number: measured over 388 regions across
+// 20 images, the best fixed setting is 0.14 at 0.349 mean IoU against 0.347 for
 // 0.13 -- noise -- and the curve is flat from 0.11 to 0.15. What pins it low is
 // the cliff to the right: median over-selection runs 6% at 0.13, 25% at 0.15,
 // 118% at 0.17 and 244% at 0.19 while IoU falls away only slowly. The wand is
 // additive, so selecting too little costs another click while selecting too
 // much costs an undo and hand correction.
 export const WAND_TOLERANCE_DEFAULT = 26 // 0.13
-
-export function wandToleranceSeed(className) {
-  const name = String(className || '').toLowerCase()
-  if (name in WAND_TOLERANCE_SEEDS) return WAND_TOLERANCE_SEEDS[name]
-  for (const [key, value] of Object.entries(WAND_TOLERANCE_SEEDS)) {
-    if (name.startsWith(key)) return value
-  }
-  return WAND_TOLERANCE_DEFAULT
-}
 
 // Budget slider (1..100) -> pixels, log-scaled over 100..100,000 and rounded to
 // two significant figures; the top of the travel means "no cap". Log because

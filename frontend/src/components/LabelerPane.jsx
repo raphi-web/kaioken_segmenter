@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   LABEL_ALPHA, UNLABELED, WAND_EDGE_ALPHA, WAND_EDGE_DARK, WAND_EDGE_LIGHT,
   WAND_PREVIEW_ALPHA, WAND_SAM_TOL_MIN, WAND_SAM_TOL_SPAN, WAND_TOL_SCALE,
-  WAND_WARN_FRACTION, wandBudget, wandToleranceSeed,
+  WAND_TOLERANCE_DEFAULT, WAND_WARN_FRACTION, wandBudget,
 } from '../constants'
 import Viewport from './Viewport'
 
@@ -107,7 +107,7 @@ function WandSlider({ label, value, min, max, readout, onChange }) {
 // the app can undo it.
 export default function LabelerPane({
   image, labels, labelsVersion, tool, view, setView, onStrokeEnd, onDiff, onSamSnap,
-  onWandSelect, classColors, classes, samAvailable,
+  onWandSelect, classColors, samAvailable,
 }) {
   const canvasRef = useRef(null)
   const [canvasReady, setCanvasReady] = useState(false)
@@ -168,8 +168,9 @@ export default function LabelerPane({
   const wandUndoRef = useRef(() => {})
   const wandCancelRef = useRef(() => {})
 
-  const wandClassName = classes?.find((c) => c.id === tool.classId)?.name
-  const wandTolerance = wandTolerances[tool.classId] ?? wandToleranceSeed(wandClassName)
+  // Kept per class so Target and Background can remember different settings,
+  // but both start from the same measured default.
+  const wandTolerance = wandTolerances[tool.classId] ?? WAND_TOLERANCE_DEFAULT
   const wandRunaway = !!wandStats
     && wandStats.count > WAND_WARN_FRACTION * Math.max(wandStats.valid, 1)
 
