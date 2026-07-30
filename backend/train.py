@@ -24,7 +24,7 @@ from data import BACKGROUND, EXCLUDED, TARGET, UNLABELED
 from model import TransformerBottleneck
 
 BATCH_SIZE = 8
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1.5e-3
 BOTTLENECK_LR = 2e-4
 CONFIDENCE_THRESHOLD = 0.92
 

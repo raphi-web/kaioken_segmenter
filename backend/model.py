@@ -20,7 +20,6 @@ Run this module directly for both variants' shapes and parameter breakdown:
 """
 
 import os
-import sys
 
 import numpy as np
 import torch
@@ -73,10 +72,7 @@ BOTTLENECK_BLOCKS = 1
 # the default initialization when present. They were trained at a different
 # patch size, class count and channel count than a given project may use, so the
 # load is filtered rather than strict -- see load_pretrained.
-if getattr(sys, "frozen", False):
-    _ROOT = sys._MEIPASS  # PyInstaller bundle, like main.py
-else:
-    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_WEIGHTS = os.path.join(_ROOT, "pretraining", "pretrained.pth")
 
 
