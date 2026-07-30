@@ -11,9 +11,8 @@ because rendering a missing score as 0.000 is indistinguishable from a model
 that got everything wrong.
 """
 
-from data import UNLABELED
+from data import TARGET, UNLABELED
 
-TARGET = 0  # positive class
 
 # Per-image outcomes. "background only" still counts toward a set's pooled
 # score: its false positives are real evidence of over-prediction, and dropping

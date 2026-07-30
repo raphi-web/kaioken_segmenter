@@ -14,7 +14,27 @@ from PIL import Image
 
 PATCH_SIZE = 96
 STRIDE = 48
-UNLABELED = 255  # label value meaning "no user annotation" (CE ignore_index)
+
+# ---------- label space ----------
+#
+# One vocabulary for the whole backend: mask files, the label buffer the frontend
+# edits, and the model's class indices are all the same numbers, which is what
+# lets a prediction be written straight into the labels and back.
+#
+# TARGET / BACKGROUND are class indices as well as label values -- the model emits
+# one logit per class and the channel index *is* the label value.
+TARGET = 0       # the positive class
+BACKGROUND = 1
+UNLABELED = 255  # "no user annotation" -- never a class; CE's ignore_index
+# Training-only: pixels the *image* has no data for. Distinct from UNLABELED so
+# the pipeline can tell "you have not labeled this" from "there is nothing here",
+# which matters because the augmentations must not paste imagery into a nodata
+# hole. Collapsed into UNLABELED before the loss sees it.
+EXCLUDED = 254
+
+# The same vocabulary is redeclared in two places on purpose, so leave them be:
+# standalone/predictor/core.py must not import from backend/ (it ships without
+# torch), and frontend/src/constants.js is another language.
 
 # Band order of the original 10-band Sentinel-2 stacks (kept for reference).
 BAND_NAMES = ["Red", "Green", "Blue", "NIR1", "RE1", "RE2", "RE3", "NIR2", "SWIR1", "SWIR2"]

@@ -20,10 +20,9 @@ import albumentations as A
 import numpy as np
 import segmentation_models_pytorch as smp
 import torch
-from data import UNLABELED
+from data import EXCLUDED, TARGET, UNLABELED
 from model import TransformerBottleneck
 
-EXCLUDED = 254
 BATCH_SIZE = 8
 LEARNING_RATE = 1e-3
 BOTTLENECK_LR = 2e-4
@@ -66,7 +65,6 @@ strong_transform = A.Compose(
 )
 
 # ---------- multi-patch augmentations ----------
-TARGET = 0
 P_MOSAIC = 0.2
 P_CUTMIX = 0.2
 P_COPY_PASTE = 0.2
