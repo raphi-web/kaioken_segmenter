@@ -18,8 +18,8 @@ import webview
 
 import report as report_module
 import train as train_module
-from data import (UNLABELED, SentinelImage, array_to_png_b64, tile_geotiff,
-                  write_mask_geotiff)
+from data import (EXCLUDED, UNLABELED, SentinelImage, array_to_png_b64,
+                  tile_geotiff, write_mask_geotiff)
 from model import DEFAULT_BOTTLENECK, SegmentationModel
 from project import (DEFAULT_CLASSES, SPLIT_ROLES, Project,
                      config_from_settings, config_path, default_config,
@@ -1147,12 +1147,43 @@ class Api:
 
         Corrupt masks read as None so callers fall back to unlabeled rather
         than failing an image switch or a training run.
+
+        Values the uint8 cast would CORRUPT become UNLABELED before the cast
+        rather than after. This app writes uint8 with 255 for unlabeled, but
+        masks produced elsewhere routinely use a signed dtype with a negative
+        nodata, and a bare cast wraps those into the class range: the -9999 in
+        this dataset's int32 rasters lands on 241, so every unlabeled pixel
+        silently became "class 241". That is not cosmetic --
+
+          * the magic wand's `protect labels` (on by default) then withholds the
+            entire selection, because no pixel reads as unlabeled, so a click
+            appears to do nothing at all;
+          * training would hand 241 to a 2-class cross-entropy as a class index.
+
+        Deliberately NOT keyed on the raster's declared nodata. A nodata that
+        already fits in 0..255 survives the cast intact, so remapping it would go
+        beyond repairing the cast and could erase real labels -- this app's
+        positive class is 0, and a mask declaring nodata=0 is far more likely to
+        be careless metadata than an instruction to void every target pixel. A
+        nodata that does not fit is caught by the range test anyway, which is the
+        only case that was ever broken.
+
+        254 is mapped too: that is EXCLUDED, reserved for the training
+        pipeline's own nodata marker and never something a saved mask should be
+        asserting.
         """
         if not os.path.exists(path):
             return None
         try:
             with rasterio.open(path) as src:
-                return src.read(1).astype(np.uint8)
+                band = src.read(1)
+            # isfinite also covers a float mask carrying NaN, which compares
+            # false against every bound and would otherwise cast to garbage.
+            unusable = (~np.isfinite(band) | (band < 0) | (band > 255)
+                        | (band == EXCLUDED))
+            if unusable.any():
+                band = np.where(unusable, UNLABELED, band)
+            return band.astype(np.uint8)
         except Exception:
             return None
 

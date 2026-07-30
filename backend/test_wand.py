@@ -12,10 +12,14 @@ Point the suite at a different project with WAND_TEST_PROJECT=/path/to/project.
 When no project is found every test skips rather than fails: the invariants are
 about real imagery, and a green run against synthetic noise would be a lie.
 
-Label buffers are set explicitly with set_labels rather than read off disk. The
-`protect` rules are about the value UNLABELED, and this dataset's masks are
-int32 with -9999 for "no label", which _read_mask_file wraps to 241 -- a real
-quirk of that data, but not one these tests should be measuring.
+Label buffers are set explicitly with set_labels rather than read off disk, so
+what `protect` does is measured against a buffer the test controls rather than
+against whatever encoding the sample masks happen to use.
+
+(Until _read_mask_file learned to repair them, this dataset's int32 -9999
+rasters cast to 241, so nothing read as UNLABELED and `protect` silently
+withheld every selection. That is fixed and covered there; these tests stay
+independent of it on purpose.)
 """
 
 import base64
