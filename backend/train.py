@@ -1,4 +1,4 @@
-"""Semi-supervised training: supervised CE + Dice + pseudo-labeling + consistency.
+"""Semi-supervised training: supervised CE + Lovasz + Dice, pseudo-labeling, consistency.
 
 FixMatch-style scheme on patches (size from the image's data profile):
 - a *weak* view (geometric augs, applied jointly to image and label mask) is
@@ -11,8 +11,9 @@ so manual ground truth always overrides model beliefs.
 
 The net emits one logit per class per pixel and the class index is the label
 value, so every target here is a plain (B, H, W) label map with UNLABELED as the
-ignore index. The supervised term pairs per-pixel cross-entropy with a Dice loss,
-which optimizes overlap directly; the pixel-wise losses keep cross-entropy alone.
+ignore index. The supervised term pairs a class-weighted per-pixel cross-entropy
+with two overlap surrogates -- Lovasz, which optimizes IoU directly, and Dice at
+half weight; the pixel-wise unsupervised losses keep cross-entropy alone.
 """
 
 import albumentations as A
@@ -29,9 +30,28 @@ LEARNING_RATE = 1e-3
 # parameters, so at the convolutional rate it is the part that destabilizes
 # first; the CNN encoder/decoder around it is unaffected by its own rate being
 # left alone.
-BOTTLENECK_LR = 5e-5
+BOTTLENECK_LR = 2e-4
 CONFIDENCE_THRESHOLD = 0.92
-LAMBDA_DICE = 1.0
+# Weights of the two overlap terms that sit alongside the per-pixel
+# cross-entropy. Lovasz leads because it is a direct surrogate for IoU -- the
+# metric the live readout and the unsupervised gate both use -- while Dice
+# contributes a softer overlap signal at half weight. They are correlated, so
+# raising both mostly just dilutes the cross-entropy. Either can be set to 0.0
+# to drop its term entirely (it is then not computed at all).
+LAMBDA_LOVASZ = 1.0
+LAMBDA_DICE = 0.5
+# Per-class weights for the supervised cross-entropy, indexed by label value
+# (0 target, 1 background). Raising the target weight makes a missed target
+# pixel cost more than a false one, so the model trades precision for recall --
+# useful when the target is the minority class and under-prediction is the
+# failure you actually see. The loss is normalized by the sum of the weights it
+# used, not by the pixel count, so changing these shifts the balance between the
+# classes without also scaling the loss magnitude (and with it the effective
+# learning rate).
+#
+# Applied to the SUPERVISED term only; see masked_ce for why the pseudo-labels
+# stay unweighted.
+CLASS_WEIGHTS = (1.5, 0.8)
 LAMBDA_PSEUDO = 0.5
 LAMBDA_CONSISTENCY = 1.0
 # The unsupervised phase is gated on the model being demonstrably good rather
@@ -286,20 +306,50 @@ def train(model, samples, epochs, progress=None, stop_event=None):
     net = model.net
     device = model.device
 
-    # reduction="sum" and an explicit divide by the valid-pixel count: smp's
-    # cross-entropy averages over *all* pixels, counting the ignored ones as
-    # zero, which on mostly-unlabeled patches would scale the supervised loss
-    # (and with it the effective learning rate) toward zero.
+    # reduction="none" so the per-pixel losses can be weighted by class before
+    # they are reduced -- smp's cross-entropy takes no `weight` argument. Its
+    # own "mean" is unusable here for a second reason anyway: it averages over
+    # *all* pixels, counting the ignored ones as zero, which on mostly-unlabeled
+    # patches would scale the supervised loss (and with it the effective
+    # learning rate) toward zero.
     cross_entropy = smp.losses.SoftCrossEntropyLoss(
-        reduction="sum", smooth_factor=0.0, ignore_index=UNLABELED
+        reduction="none", smooth_factor=0.0, ignore_index=UNLABELED
     )
+    # Neither overlap term takes CLASS_WEIGHTS, and neither needs to: both
+    # average over the classes equally, so each class already contributes the
+    # same regardless of how many pixels it has. Class weighting is a
+    # cross-entropy concern only.
     dice = smp.losses.DiceLoss(
         mode="multiclass", ignore_index=UNLABELED, from_logits=True
     )
+    # Lovasz-Softmax: a direct surrogate for IoU, averaged over the classes
+    # actually present in the batch. Takes logits (it softmaxes internally).
+    lovasz = smp.losses.LovaszLoss(mode="multiclass", ignore_index=UNLABELED)
+    weights = torch.tensor(CLASS_WEIGHTS, dtype=torch.float32, device=device)
 
-    def masked_ce(logits, target, mask):
-        """Cross-entropy averaged over the pixels `mask` selects (0.0 if none)."""
-        return cross_entropy(logits, target) / mask.sum().clamp(min=1)
+    def masked_ce(logits, target, mask, weighted=True):
+        """Cross-entropy over the pixels `mask` selects (0.0 if none).
+
+        Weighted by CLASS_WEIGHTS and normalized by the sum of the weights
+        actually used, which is what makes the weights a reweighting rather than
+        a rescaling: with equal weights this is exactly the plain mean over the
+        masked pixels.
+
+        `weighted=False` is for the pseudo-label term. Those targets are the
+        model's own predictions, so up-weighting the target class there would
+        feed the bias back into itself -- the model over-predicts target, is
+        trained harder on its own target guesses, and over-predicts further.
+        The supervised term is anchored to user labels, where the same weight is
+        a controlled prior instead of a loop.
+        """
+        per_px = cross_entropy(logits, target).squeeze(1)  # (B, H, W), 0 if ignored
+        if not weighted:
+            return per_px.sum() / mask.sum().clamp(min=1)
+        # target holds UNLABELED (255) outside the mask, which is not a valid
+        # index; zero those out rather than indexing with them.
+        safe = torch.where(mask, target, torch.zeros_like(target))
+        per_px_weight = weights[safe] * mask
+        return (per_px * per_px_weight).sum() / per_px_weight.sum().clamp(min=1e-6)
 
     # The convolutional encoder/decoder trains at LEARNING_RATE; the transformer
     # bottleneck alone gets BOTTLENECK_LR. Everything else is one group because
@@ -334,7 +384,7 @@ def train(model, samples, epochs, progress=None, stop_event=None):
             )
 
             ramp = min(1.0, (epoch - gate_epoch + 1) / ramp_epochs)
-        sums = {"sup": 0.0, "dice": 0.0, "pseudo": 0.0, "cons": 0.0}
+        sums = {"sup": 0.0, "dice": 0.0, "lovasz": 0.0, "pseudo": 0.0, "cons": 0.0}
         n_batches = 0
         iou_inter = 0.0  # target-class intersection/union over labeled pixels,
         iou_union = 0.0  # accumulated across the epoch for a live IoU readout
@@ -363,13 +413,22 @@ def train(model, samples, epochs, progress=None, stop_event=None):
                     gt_t = (sup_target == TARGET) & labeled
                     iou_inter += (pred_t & gt_t).sum().item()
                     iou_union += (pred_t | gt_t).sum().item()
+                # A batch can carry no user-labeled pixel at all: once the gate
+                # opens, fully-unlabeled patches are the bulk of them. All three
+                # supervised terms are then skipped together, because smp's
+                # multiclass Lovasz returns an EMPTY tensor rather than a scalar
+                # 0.0 when every pixel is ignored, and adding that to the total
+                # makes the whole loss non-scalar -- backward() then raises.
+                zero = logits.sum() * 0.0  # a real 0 that keeps the graph intact
                 if labeled.any():
                     loss_sup = masked_ce(logits, sup_target, labeled)
+                    loss_dice = dice(logits, sup_target) if LAMBDA_DICE else zero
+                    loss_lovasz = lovasz(logits, sup_target) if LAMBDA_LOVASZ else zero
                 else:
-                    loss_sup = logits.sum() * 0.0
-                loss_dice = dice(logits, sup_target)
+                    loss_sup = loss_dice = loss_lovasz = zero
 
-                loss = loss_sup + LAMBDA_DICE * loss_dice
+                loss = (loss_sup + LAMBDA_DICE * loss_dice
+                        + LAMBDA_LOVASZ * loss_lovasz)
 
                 if not warmup:
                     weak = weak.to(device)
@@ -389,6 +448,7 @@ def train(model, samples, epochs, progress=None, stop_event=None):
                             logits,
                             pseudo.masked_fill(~pseudo_mask, UNLABELED),
                             pseudo_mask,
+                            weighted=False,
                         )
                     else:
                         loss_pseudo = logits.sum() * 0.0
@@ -408,6 +468,7 @@ def train(model, samples, epochs, progress=None, stop_event=None):
 
                 sums["sup"] += loss_sup.detach().item()
                 sums["dice"] += loss_dice.detach().item()
+                sums["lovasz"] += loss_lovasz.detach().item()
                 if not warmup:
                     sums["pseudo"] += loss_pseudo.detach().item()
                     sums["cons"] += loss_cons.detach().item()
@@ -415,7 +476,10 @@ def train(model, samples, epochs, progress=None, stop_event=None):
             del image, labels  # bound memory: one image resident at a time
 
         denom = n_batches or 1
-        loss_sup_epoch = (sums["sup"] + LAMBDA_DICE * sums["dice"]) / denom
+        # One supervised number, composed exactly like the batch loss, so the
+        # figure the UI shows and the one the scheduler steps on are the same.
+        loss_sup_epoch = (sums["sup"] + LAMBDA_DICE * sums["dice"]
+                          + LAMBDA_LOVASZ * sums["lovasz"]) / denom
 
 
         if n_batches:
