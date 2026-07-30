@@ -25,44 +25,19 @@ from data import UNLABELED
 EXCLUDED = 254
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-3
-# The transformer bottleneck trains an order of magnitude slower than the rest
-# of the net. It is the only attention block here and it carries ~80% of the
-# parameters, so at the convolutional rate it is the part that destabilizes
-# first; the CNN encoder/decoder around it is unaffected by its own rate being
-# left alone.
 BOTTLENECK_LR = 2e-4
 CONFIDENCE_THRESHOLD = 0.92
-# Weights of the two overlap terms that sit alongside the per-pixel
-# cross-entropy. Lovasz leads because it is a direct surrogate for IoU -- the
-# metric the live readout and the unsupervised gate both use -- while Dice
-# contributes a softer overlap signal at half weight. They are correlated, so
-# raising both mostly just dilutes the cross-entropy. Either can be set to 0.0
-# to drop its term entirely (it is then not computed at all).
+
 LAMBDA_LOVASZ = 1.0
 LAMBDA_DICE = 0.5
-# Per-class weights for the supervised cross-entropy, indexed by label value
-# (0 target, 1 background). Raising the target weight makes a missed target
-# pixel cost more than a false one, so the model trades precision for recall --
-# useful when the target is the minority class and under-prediction is the
-# failure you actually see. The loss is normalized by the sum of the weights it
-# used, not by the pixel count, so changing these shifts the balance between the
-# classes without also scaling the loss magnitude (and with it the effective
-# learning rate).
-#
-# Applied to the SUPERVISED term only; see masked_ce for why the pseudo-labels
-# stay unweighted.
-CLASS_WEIGHTS = (1.5, 0.8)
+
+CLASS_WEIGHTS = (2.0, 1.0)
 LAMBDA_PSEUDO = 0.5
 LAMBDA_CONSISTENCY = 1.0
-# The unsupervised phase is gated on the model being demonstrably good rather
-# than on an epoch count: pseudo-labels are only worth training on once the
-# model's own predictions are. The threshold is read against the same live
-# target IoU the run reports, which is measured on the strongly-augmented view
-# and so sits below what the model scores on clean imagery.
+
 TARGET_IOU_STABILITY = 0.70  # live target IoU the model must reach...
 STABILITY_PATIENCE = 3  # ...and hold for this many consecutive epochs
-# Once the gate opens the ramp spans a share of whatever training is left
-# instead of a fixed count, so a long run fades the terms in slowly.
+
 RAMP_FRACTION = 0.6
 RAMP_MIN_EPOCHS = 5
 
