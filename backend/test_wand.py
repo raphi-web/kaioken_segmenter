@@ -290,13 +290,13 @@ class TestConnectivity(WandTestCase):
         field = np.ones((self.h, self.w), np.float32)
         field[10:20, 10:20] = 0.0   # the clicked block
         field[20:30, 20:30] = 0.0   # touches it only at pixel (20, 20)'s corner
-        original = self.api._spectral_field
-        self.api._spectral_field = lambda y, x, n: field
+        original = self.api._wand._spectral_field
+        self.api._wand._spectral_field = lambda y, x, n: field
         try:
             self.api._clear_wand_cache()
             mask = self.select_mask([[15, 15]], tolerance=0.5)
         finally:
-            self.api._spectral_field = original
+            self.api._wand._spectral_field = original
             self.api._clear_wand_cache()
         self.assertTrue(mask[10:20, 10:20].all())
         self.assertFalse(mask[20:30, 20:30].any())
@@ -385,13 +385,13 @@ class TestProtection(WandTestCase):
         field = np.ones((self.h, self.w), np.float32)
         field[mid - 60:mid + 60, 100:130] = 0.0  # a bar spanning the stripe
         self.stripe_labels()
-        original = self.api._spectral_field
-        self.api._spectral_field = lambda y, x, n: field
+        original = self.api._wand._spectral_field
+        self.api._wand._spectral_field = lambda y, x, n: field
         try:
             self.api._clear_wand_cache()
             mask = self.select_mask([[115, mid - 50]], tolerance=0.5, protect=True)
         finally:
-            self.api._spectral_field = original
+            self.api._wand._spectral_field = original
             self.api._clear_wand_cache()
         far_side = mask[mid + 20:mid + 60, 100:130]
         self.assertTrue(far_side.any(), "the fill did not cross the labeled stripe")
@@ -436,15 +436,15 @@ class TestNegatives(WandTestCase):
         other[200:220, 200:220] = 0.0
         other[300:320, 60:80] = 0.0
         fields = {(50, 50): field, (210, 210): other, (310, 70): other}
-        original = self.api._spectral_field
-        self.api._spectral_field = lambda y, x, n: fields[(y, x)]
+        original = self.api._wand._spectral_field
+        self.api._wand._spectral_field = lambda y, x, n: fields[(y, x)]
         try:
             self.api._clear_wand_cache()
             plain = self.select_mask([[50, 50]], tolerance=0.5, **{"global": True})
             cut = self.select_mask([[50, 50]], tolerance=0.5, **{"global": True},
                                    negatives=[[210, 210]])
         finally:
-            self.api._spectral_field = original
+            self.api._wand._spectral_field = original
             self.api._clear_wand_cache()
         self.assertTrue(plain[300:320, 60:80].any())
         # The negative was clicked on one fragment; the OTHER one goes too.
@@ -486,7 +486,7 @@ class TestEmbeddingSource(WandTestCase):
         the field is computed on a smaller grid and upsampled."""
         for level in ("fine", "mid", "deep"):
             with self.subTest(level=level):
-                field = self.api._embedding_field(self.A[1], self.A[0], 9, level)
+                field = self.api._wand._embedding_field(self.A[1], self.A[0], 9, level)
                 self.assertEqual(field.shape, (self.h, self.w))
                 self.assertTrue(np.isfinite(field).all())
                 self.assertGreaterEqual(float(field.min()), 0.0)
@@ -494,8 +494,8 @@ class TestEmbeddingSource(WandTestCase):
 
     def test_the_two_sources_are_genuinely_different(self):
         """Guards against the embedding path quietly falling back to spectral."""
-        spectral = self.api._spectral_field(self.A[1], self.A[0], 9)
-        embedded = self.api._embedding_field(self.A[1], self.A[0], 9, "fine")
+        spectral = self.api._wand._spectral_field(self.A[1], self.A[0], 9)
+        embedded = self.api._wand._embedding_field(self.A[1], self.A[0], 9, "fine")
         self.assertFalse(np.allclose(spectral, embedded))
         self.assertNotEqual(
             int(self.select_mask([self.A], tolerance=0.13).sum()),
