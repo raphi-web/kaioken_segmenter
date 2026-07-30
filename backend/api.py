@@ -128,6 +128,33 @@ class Api:
         """
         self._wand.clear()
 
+    @staticmethod
+    def _setup_defaults(config, **overrides):
+        """The setup dialog's `defaults` payload for a config, plus overrides.
+
+        The single place that maps a data_profile onto the setup form's field
+        names, so a new profile key is added once instead of once per entry
+        point. `overrides` carries whatever the caller knows better -- a band
+        count probed off a raster, a folder it is about to create, the tiling
+        parameters that only the GeoTIFF path has.
+        """
+        profile = config["data_profile"]
+        defaults = {
+            "project_name": config["project_name"],
+            "input_channels": profile["input_channels"],
+            "input_patch_size": profile["input_patch_size"][0],
+            "band_names": profile["band_names"],
+            "display_bands": profile["display_bands"],
+            "use_pointrend": profile["use_pointrend"],
+            "bottleneck": profile.get("bottleneck", DEFAULT_BOTTLENECK),
+            "validation_ratio": config["split"]["validation_ratio"],
+            "images_folder": config["paths"]["images_folder"],
+            "masks_user": config["paths"]["masks_user"],
+            "masks_ai": config["paths"]["masks_ai"],
+        }
+        defaults.update(overrides)
+        return defaults
+
     def _display_bands(self):
         """The project's configured [R, G, B] display band indices, or None
         (which makes rgb_composite fall back to the first three bands)."""
@@ -618,10 +645,7 @@ class Api:
         if self._report["running"]:
             return {"ok": False, "error": "Wait for the accuracy report to finish"}
         with self._lock:
-            self._model = SegmentationModel(in_channels=self._model.in_channels,
-                                            patch_size=self._model.patch_size,
-                                            use_pointrend=self._model.use_pointrend,
-                                            bottleneck=self._model.bottleneck)
+            self._model = SegmentationModel(**self._model.profile)
             self._model_version += 1
             self._class_map = None
             self._probs = None
@@ -657,21 +681,8 @@ class Api:
         config = default_config(os.path.basename(os.path.normpath(root)) or "project",
                                 input_channels=channels or 10)
         return {"ok": True, "needs_setup": True, "root": root,
-                "defaults": {
-                    "project_name": config["project_name"],
-                    "input_channels": config["data_profile"]["input_channels"],
-                    "input_patch_size": config["data_profile"]["input_patch_size"][0],
-                    "band_names": config["data_profile"]["band_names"],
-                    "display_bands": config["data_profile"]["display_bands"],
-                    "use_pointrend": config["data_profile"]["use_pointrend"],
-                    "bottleneck": config["data_profile"].get(
-                        "bottleneck", DEFAULT_BOTTLENECK),
-                    "validation_ratio": config["split"]["validation_ratio"],
-                    "images_folder": config["paths"]["images_folder"],
-                    "masks_user": config["paths"]["masks_user"],
-                    "masks_ai": config["paths"]["masks_ai"],
-                    "bands_detected": channels is not None,
-                }}
+                "defaults": self._setup_defaults(
+                    config, bands_detected=channels is not None)}
 
     def new_project_from_geotiff(self):
         """Pick one GeoTIFF and propose a project built by tiling it.
@@ -703,29 +714,23 @@ class Api:
                       else config["data_profile"]["band_names"])
         return {"ok": True, "needs_setup": True, "mode": "geotiff",
                 "source": source,
-                "defaults": {
-                    "project_name": config["project_name"],
-                    "input_channels": channels,
-                    "input_patch_size": patch,
-                    "band_names": band_names,
-                    "display_bands": config["data_profile"]["display_bands"],
-                    "use_pointrend": config["data_profile"]["use_pointrend"],
-                    "bottleneck": config["data_profile"].get(
-                        "bottleneck", DEFAULT_BOTTLENECK),
-                    "validation_ratio": config["split"]["validation_ratio"],
-                    "images_folder": "images",
-                    "masks_user": config["paths"]["masks_user"],
-                    "masks_ai": config["paths"]["masks_ai"],
-                    "bands_detected": True,
-                    "output_root": self._suggest_project_dir(source, stem),
-                    "tile_width": tile,
-                    "tile_height": tile,
-                    "overlap": 0,
-                    "source_name": os.path.basename(source),
-                    "source_width": width,
-                    "source_height": height,
-                    "source_georeferenced": has_crs,
-                }}
+                "defaults": self._setup_defaults(
+                    config,
+                    input_channels=channels,
+                    band_names=band_names,
+                    # Tiling writes the images itself, into a folder that does
+                    # not exist yet.
+                    images_folder="images",
+                    bands_detected=True,
+                    output_root=self._suggest_project_dir(source, stem),
+                    tile_width=tile,
+                    tile_height=tile,
+                    overlap=0,
+                    source_name=os.path.basename(source),
+                    source_width=width,
+                    source_height=height,
+                    source_georeferenced=has_crs,
+                )}
 
     @staticmethod
     def _suggest_project_dir(source, stem):
@@ -853,10 +858,7 @@ class Api:
                 project = Project.create(root)
                 save_config(root, project.config)
                 created = True
-            model = SegmentationModel(in_channels=project.input_channels,
-                                      patch_size=project.patch_size,
-                                      use_pointrend=project.use_pointrend,
-                                      bottleneck=project.bottleneck)
+            model = SegmentationModel.for_project(project)
         except (OSError, ValueError) as e:
             return {"ok": False, "error": str(e)}
         restored_epochs = self._load_model_checkpoint(model, project)
@@ -958,10 +960,7 @@ class Api:
             # the bottleneck is a different architecture, so _load_model_checkpoint
             # rejects the old checkpoint outright and training starts over.
             with self._lock:
-                model = SegmentationModel(in_channels=self._model.in_channels,
-                                          patch_size=self._model.patch_size,
-                                          use_pointrend=self._project.use_pointrend,
-                                          bottleneck=self._project.bottleneck)
+                model = SegmentationModel.for_project(self._project)
                 self._status["total_epochs"] = self._load_model_checkpoint(
                     model, self._project)
                 self._model = model

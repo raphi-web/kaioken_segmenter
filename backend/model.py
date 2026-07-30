@@ -653,6 +653,34 @@ class SegmentationModel:
         self.net = net.to(self.device)
         self.pretrained_tensors = load_pretrained(self.net, weights)
 
+    @classmethod
+    def for_project(cls, project, **overrides):
+        """Build the model a project's data_profile describes.
+
+        The one place that knows which profile fields define the network, so
+        adding a fifth knob is one edit here rather than one per call site.
+        Duck-typed on the four properties rather than importing Project, which
+        would be a cycle (project.py imports this module for BOTTLENECKS).
+        """
+        return cls(in_channels=project.input_channels,
+                   patch_size=project.patch_size,
+                   use_pointrend=project.use_pointrend,
+                   bottleneck=project.bottleneck,
+                   **overrides)
+
+    @property
+    def profile(self):
+        """The kwargs that define this network, for rebuilding it identically.
+
+        Used where the profile has to come from the live model rather than from a
+        project -- `reset_model` runs on a standalone image too, where there is no
+        project to read.
+        """
+        return {"in_channels": self.in_channels,
+                "patch_size": self.patch_size,
+                "use_pointrend": self.use_pointrend,
+                "bottleneck": self.bottleneck}
+
     @property
     def variable_input(self):
         """Whether the net accepts input sizes other than the one it was built for.
