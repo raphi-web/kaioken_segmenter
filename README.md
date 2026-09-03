@@ -6,13 +6,19 @@ A label tool for Remote Sensing, supports GeoTiffs with more than just 3 Bands!
 
 ## Disclaimer
 
-Prototype for human-in-the-loop (binary) semantic segmentation in remote
-sensing with semi-supervised training. **AI-assisted code generation was used
-to bootstrap this project.** No guarantee it works on every machine.
+This is a prototype for human-in-the-loop (binary) semantic segmentation in
+remote sensing with semi-supervised training.
+I build this after some exciting talks in a conference. **I also used
+AI code generation in this project to get started.**
 
-Workflow: paint ground-truth strokes on the right pane, click **Train**, watch
-live inference refresh on the left pane. Iterate, then export the model
-(`.pth`/`.onnx`), a standalone executable, or the merged mask.
+The tool turned out to be very useful to my work in remote sensing, and I
+hope it is useful for others too.
+**At the current state I can't guarantee that it works on every machine!**
+
+Workflow: paint ground-truth strokes on the right pane, click
+**Train**, and watch the live model inference refresh on the left pane.
+Iterate until the prediction is good, then export the model (`.pth`/`.onnx`),
+a standalone executable, or the merged mask.
 
 ## Install & run
 
