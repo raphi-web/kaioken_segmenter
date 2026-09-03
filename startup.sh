@@ -1,0 +1,1 @@
+nohup ./venv/bin/python3 -m kaioken start > kaioken.log 2>&1 &
