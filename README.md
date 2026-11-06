@@ -162,16 +162,6 @@ Run from **outside** the repo. It should print `source tree : (installed, not
 a checkout)` and point at `site-packages/kaioken/_frontend/`. If it names the
 repo, you're running the checkout.
 
-### Releasing
-
-1. Bump `__version__` in `src/kaioken/__init__.py` — the only place;
-   `pyproject.toml` reads it from there.
-2. `rm -rf dist/ && python3 -m build`
-3. Attach the `.whl` (and `.tar.gz` if wanted) to a GitHub release.
-
-Model assets are versioned separately under the `assets-v1` tag — weights
-change less often than code. See `ASSET_RELEASE` in `src/kaioken/assets.py`.
-
 ### Troubleshooting
 
 | Symptom                                         | Cause                                                                                                                        |
